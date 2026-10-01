@@ -1,0 +1,2274 @@
+import os
+import re
+import sqlite3
+import subprocess
+from datetime import date, datetime, timedelta
+from functools import wraps
+from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
+from collections import Counter
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
+try:
+    import oracledb
+except ImportError:
+    oracledb = None
+
+try:
+    from openpyxl import load_workbook
+except ImportError:
+    load_workbook = None
+
+app = Flask(__name__)
+app.secret_key = os.getenv('TOOLMGMT_SECRET_KEY', os.urandom(24))
+
+# Jinja filter so templates can check if a link is a local Windows path
+app.jinja_env.filters['regex_search'] = lambda value, pattern: bool(re.match(pattern, value))
+
+DATABASE = os.getenv('TOOLMGMT_DB_PATH', os.path.join(os.path.dirname(__file__), 'database.db'))
+SHIFT_PLAN_FILE = os.path.join(os.path.dirname(__file__), 'WFH_Shift_Plan.xlsx')
+
+DEFAULT_USERNAME = os.getenv('TOOLMGMT_DEFAULT_USERNAME', 'admin')
+DEFAULT_PASSWORD = os.getenv('TOOLMGMT_DEFAULT_PASSWORD', 'admin@123')
+
+ORACLE_DEFAULT_USER = 'sim_admin'
+ORACLE_DEFAULT_HOST = '192.1.2.45'
+ORACLE_DEFAULT_PORT = '1521'
+ORACLE_DEFAULT_SERVICE = 'ptsdbin'
+
+STAGE_NAME_TO_CODE = {
+    'INDIA': '5',
+    'VA': '10',
+    'DEV-UAT': '15',
+    'UAT': '20',
+    'UAT2': '21',
+    'TRAINING': '22',
+    'STAGE': '25',
+    'PILOT': '30',
+    'HD2': '35',
+    'PROD': '40',
+    'QA': '45',
+    'PRE-PROD': '50',
+    'VALIDATION': '55',
+    'TEST': '70',
+    'DEV_UAT02': '75',
+    'TEST02': '80',
+    'PFIX': '85',
+    'INDIA90': '90',
+}
+
+def login_required(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if 'user' not in session:
+            return redirect(url_for('login'))
+        return view_func(*args, **kwargs)
+
+    return wrapped
+
+
+def parse_instance_and_patches(message):
+    text = (message or '').strip()
+
+    patch_numbers = []
+    patch_anchor = re.search(r'patch(?:\s*no)?\s*[:=\-]?\s*([0-9,\s]+)', text, re.IGNORECASE)
+    if patch_anchor:
+        patch_numbers = re.findall(r'\d+', patch_anchor.group(1))
+    if not patch_numbers:
+        patch_numbers = re.findall(r'\b\d+\b', text)
+
+    dedup_patches = []
+    seen = set()
+    for patch in patch_numbers:
+        if patch not in seen:
+            seen.add(patch)
+            dedup_patches.append(patch)
+
+    instance_match = re.search(
+        r'instance(?:\s*id)?\s*[:=\-]?\s*([A-Za-z0-9_\-]+)',
+        text,
+        re.IGNORECASE,
+    )
+    if not instance_match:
+        instance_match = re.search(r'\b(?:of|for|in)\s+([A-Za-z][A-Za-z0-9_\-]+)\b', text, re.IGNORECASE)
+
+    instance_id = instance_match.group(1).upper() if instance_match else None
+    return instance_id, dedup_patches
+
+
+def parse_instance_reference(message):
+    text = (message or '').strip()
+    match = re.search(r'instance(?:\s*id)?\s*[:=\-]?\s*([A-Za-z0-9_\-]+)', text, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+
+    single = re.fullmatch(r'[A-Za-z][A-Za-z0-9_\-]*', text)
+    if single:
+        return text.upper()
+
+    tail = re.search(r'\b(?:of|for|in)\s+([A-Za-z][A-Za-z0-9_\-]+)\b\s*$', text, re.IGNORECASE)
+    if tail:
+        return tail.group(1).upper()
+    return None
+
+
+def is_instance_only_message(message, instance_id):
+    text = (message or '').strip()
+    lower = text.lower()
+    if any(token in lower for token in ('patch', 'file', 'group', 'tag', 'who', 'build', 'taken', 'take')):
+        return False
+
+    if text.upper() == instance_id:
+        return True
+
+    return bool(re.fullmatch(r'instance(?:\s*id)?\s*[:=\-]?\s*[A-Za-z0-9_\-]+', text, re.IGNORECASE))
+
+
+def is_patch_owner_question(message):
+    text = (message or '').lower()
+    return 'who' in text and 'patch' in text and any(token in text for token in ('take', 'took', 'taken', 'build', 'built'))
+
+
+def is_patch_list_request(message):
+    text = (message or '').lower()
+    return 'patch no' in text or 'patch number' in text or text.strip() in ('patch', 'patches')
+
+
+def is_group_tags_request(message):
+    text = (message or '').lower()
+    return 'group tag' in text or 'group tags' in text or 'group id' in text or text.strip() in ('group', 'groups')
+
+
+
+def is_consolidation_request(message):
+    text = (message or '').lower()
+    return any(token in text for token in ('consolidation', 'client_server_instance_dtl', 'instance detail'))
+
+
+def is_qa_server_request(message):
+    text = (message or '').lower()
+    return any(token in text for token in ('qa server', 'qa details', 'client_server_map'))
+
+
+def _normalize_intent_text(message):
+    return re.sub(r'[^a-z0-9]+', ' ', (message or '').lower()).strip()
+
+
+def _is_deployment_alias(message):
+    text = _normalize_intent_text(message)
+    compact = text.replace(' ', '')
+
+    exact_aliases = {
+        'dep req',
+        'deployment request',
+        'deployment reques',
+        'deployment',
+        'dep',
+        'request',
+        'req',
+    }
+    compact_aliases = {
+        'depreq',
+        'deploymentrequest',
+        'deploymentreques',
+        'deployment',
+        'dep',
+        'request',
+        'req',
+    }
+
+    if text in exact_aliases or compact in compact_aliases:
+        return True
+
+    return any(token in text for token in ('deploy req', 'deployment request', 'patch deployment', 'patch info'))
+
+
+def is_deployment_request(message):
+    return _is_deployment_alias(message)
+
+
+def is_all_details_request(message):
+    text = (message or '').lower()
+    return any(token in text for token in ('all details', 'complete details', 'full details', 'everything'))
+
+def _normalize_stage_token(token):
+    return re.sub(r'[^A-Z0-9]+', '', (token or '').upper())
+
+
+def _stage_lookup_map():
+    data = {}
+    for name, code in STAGE_NAME_TO_CODE.items():
+        data[_normalize_stage_token(name)] = code
+    return data
+
+
+def extract_stage_code(message):
+    text = (message or '').strip()
+    if not text:
+        return None
+
+    exact_num = re.search(r'\b(\d{1,3})\b', text)
+    if exact_num:
+        return exact_num.group(1)
+
+    normalized = _normalize_stage_token(text)
+    lookup = _stage_lookup_map()
+    if normalized in lookup:
+        return lookup[normalized]
+
+    for name, code in STAGE_NAME_TO_CODE.items():
+        if _normalize_stage_token(name) in normalized:
+            return code
+    return None
+
+
+def extract_group_tag(message):
+    text = (message or '').strip()
+    if not text:
+        return None
+
+    match = re.search(r'group(?:\s*tag|\s*id)?\s*[:=\-]?\s*([A-Za-z0-9_\-]+)', text, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+
+    plain = re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_\-]*', text)
+    if plain:
+        return text.upper()
+    return None
+
+
+def extract_filename_pattern(message):
+    text = (message or '').strip()
+    quoted = re.search(r'["\']([^"\']+)["\']', text)
+    if quoted:
+        return quoted.group(1)
+
+    match = re.search(r'file(?:name)?\s*[:=\-]?\s*([^,]+)$', text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+
+def extract_patch_seq_no(message):
+    text = (message or '').strip().upper()
+    if not text:
+        return None
+
+    exact = re.search(r'\b([A-Z0-9]+-P-[0-9]{3,})\b', text)
+    if exact:
+        return exact.group(1)
+
+    match = re.search(r'patch\s*seq\s*no\s*[:=\-]?\s*([A-Z0-9]+-P-[0-9]{3,})', text, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    return None
+
+
+def parse_patch_seq_parts(patch_seq_no):
+    if not patch_seq_no:
+        return None, None, None
+
+    match = re.match(r'^([A-Z0-9]+)-([A-Z])-([0-9]{3,})$', patch_seq_no.upper())
+    if not match:
+        return None, None, None
+    return match.group(1), match.group(2), match.group(3)
+
+def is_files_in_group_tag_request(message):
+    text = (message or '').lower()
+    return 'group tag' in text and 'file' in text
+
+
+def is_files_in_patch_request(message):
+    text = (message or '').lower()
+    return ('file' in text and 'patch' in text) or 'files in patch' in text
+
+
+def is_req_extra_patch_request(message):
+    text = (message or '').lower()
+    return 'extra patch' in text or ('req no' in text and 'patch' in text) or ('request no' in text and 'patch' in text)
+
+
+def is_deployment_request_by_stage(message):
+    text = _normalize_intent_text(message)
+    return _is_deployment_alias(message) or ('deploy' in text and 'stage' in text)
+
+
+def is_stage_reference_request(message):
+    text = (message or '').lower()
+    return 'stage no' in text or 'patch status' in text
+
+
+def is_file_release_patch_request(message):
+    text = (message or '').lower()
+    return 'file released' in text or ('filename' in text and 'patch' in text)
+
+
+def is_group_tag_owner_request(message):
+    text = (message or '').lower()
+    return 'grouptag given by' in text or ('group tag' in text and 'given by' in text)
+
+
+def is_test_deployment_pending_request(message):
+    text = (message or '').lower()
+    return 'test deployment' in text and 'pending' in text
+
+
+def is_auto_patch_extracted_request(message):
+    text = (message or '').lower()
+    return 'auto patch' in text and 'extracted' in text
+
+
+def is_vc_shift_request(message):
+    text = (message or '').lower()
+    return (
+        'vc shift' in text
+        or 'shift plan' in text
+        or 'reviewer plan' in text
+        or 'today reviewer' in text
+        or 'who is reviewer' in text
+        or 'shift' in text
+        or 'review' in text
+    )
+
+def _get_windows_user_env(name):
+    if os.name != 'nt' or winreg is None:
+        return None
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Environment') as key:
+            value, _ = winreg.QueryValueEx(key, name)
+            return value.strip() if isinstance(value, str) else value
+    except OSError:
+        return None
+
+
+def get_oracle_connection():
+    if oracledb is None:
+        return None, 'Python package "oracledb" is not installed. Install it with: python -m pip install oracledb'
+
+    oracle_user = os.getenv('ORACLE_USER', ORACLE_DEFAULT_USER)
+    oracle_password = os.getenv('ORACLE_PASSWORD') or _get_windows_user_env('ORACLE_PASSWORD')
+    oracle_host = os.getenv('ORACLE_HOST', ORACLE_DEFAULT_HOST)
+    oracle_port = os.getenv('ORACLE_PORT', ORACLE_DEFAULT_PORT)
+    oracle_service = os.getenv('ORACLE_SERVICE', ORACLE_DEFAULT_SERVICE)
+
+    if not oracle_password:
+        return None, 'ORACLE_PASSWORD is not set. Set it in your terminal before starting the app.'
+
+    dsn = f'{oracle_host}:{oracle_port}/{oracle_service}'
+    try:
+        conn = oracledb.connect(user=oracle_user, password=oracle_password, dsn=dsn)
+        return conn, None
+    except Exception as exc:
+        return None, f'Oracle connection failed: {exc}'
+
+
+def _build_in_clause(bind_prefix, values, bind_map):
+    placeholders = []
+    for idx, value in enumerate(values):
+        key = f'{bind_prefix}{idx}'
+        bind_map[key] = value
+        placeholders.append(f':{key}')
+    return ', '.join(placeholders)
+
+
+def _table_columns(cursor, table_name):
+    cursor.execute(
+        """
+        SELECT column_name
+        FROM user_tab_columns
+        WHERE table_name = :table_name
+        ORDER BY column_id
+        """,
+        {'table_name': table_name},
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+
+
+def _table_columns_info(cursor, table_name):
+    cursor.execute(
+        """
+        SELECT column_name, data_type
+        FROM user_tab_columns
+        WHERE table_name = :table_name
+        ORDER BY column_id
+        """,
+        {'table_name': table_name},
+    )
+    return [{'name': row[0], 'type': row[1]} for row in cursor.fetchall()]
+
+
+def _pick_column(columns, candidates):
+    for candidate in candidates:
+        if candidate in columns:
+            return candidate
+    return None
+
+
+def fetch_table_details(table_name, instance_id=None, patch_no=None, qa_only=False, max_rows=8):
+    conn, err = get_oracle_connection()
+    if err:
+        return {'table': table_name, 'error': err}
+
+    try:
+        cur = conn.cursor()
+        table_name = table_name.upper()
+        column_info = _table_columns_info(cur, table_name)
+        if not column_info:
+            return {'table': table_name, 'error': f'{table_name} is not accessible in current schema.'}
+
+        columns = [item['name'] for item in column_info]
+        where_clauses = []
+        bind_map = {}
+        warnings = []
+
+        instance_col = _pick_column(columns, ('INSTANCE_ID', 'INSTANCE', 'INST_ID', 'INSTANCE_NAME', 'CLIENT_INSTANCE_ID'))
+        patch_col = _pick_column(columns, ('PATCH_NO', 'PATCH_NUMBER', 'PATCH_ID', 'PATCHID'))
+        qa_col = _pick_column(columns, ('SERVER_TYPE', 'ENVIRONMENT', 'SERVER_ENV', 'ENV', 'MAP_TYPE', 'SERVER_CATEGORY'))
+
+        if instance_id:
+            if instance_col:
+                where_clauses.append(f"UPPER(TO_CHAR({instance_col})) = UPPER(:instance_id)")
+                bind_map['instance_id'] = instance_id
+            else:
+                warnings.append('No instance column found; instance filter not applied.')
+
+        if patch_no:
+            if patch_col:
+                where_clauses.append(f"TO_CHAR({patch_col}) = :patch_no")
+                bind_map['patch_no'] = str(patch_no)
+            else:
+                warnings.append('No patch column found; patch filter not applied.')
+
+        if qa_only:
+            if qa_col:
+                where_clauses.append(f"UPPER(TO_CHAR({qa_col})) LIKE '%QA%'")
+            else:
+                warnings.append('No QA classifier column found; QA filter not applied.')
+
+        where_sql = ' WHERE ' + ' AND '.join(where_clauses) if where_clauses else ''
+
+        count_sql = f"SELECT COUNT(1) FROM {table_name}{where_sql}"
+        cur.execute(count_sql, bind_map)
+        row_count = int(cur.fetchone()[0])
+
+        safe_select_cols = [item['name'] for item in column_info if 'TIME ZONE' not in (item['type'] or '').upper()]
+        if not safe_select_cols:
+            safe_select_cols = columns
+        safe_select_cols = safe_select_cols[:12]
+
+        select_sql = (
+            f"SELECT {', '.join(safe_select_cols)} FROM {table_name}{where_sql} FETCH FIRST {int(max_rows)} ROWS ONLY"
+        )
+        cur.execute(select_sql, bind_map)
+
+        result_rows = []
+        for row in cur.fetchall():
+            row_map = {}
+            for idx, col in enumerate(safe_select_cols):
+                value = row[idx]
+                row_map[col] = str(value) if value is not None else None
+            result_rows.append(row_map)
+
+        return {
+            'table': table_name,
+            'row_count': row_count,
+            'columns': safe_select_cols,
+            'rows': result_rows,
+            'warnings': warnings,
+            'filters': {
+                'instance_column': instance_col,
+                'patch_column': patch_col,
+                'qa_column': qa_col if qa_only else None,
+            },
+        }
+    except Exception as exc:
+        return {'table': table_name, 'error': f'Query failed: {exc}'}
+    finally:
+        conn.close()
+
+
+def _render_table_excerpt(result, title=None):
+    table_name = title or result.get('table', 'TABLE')
+    if result.get('error'):
+        return [f'{table_name}: {result["error"]}']
+
+    lines = [f'{table_name}: {result["row_count"]} row(s)']
+    rows = result.get('rows', [])
+    if rows:
+        for row in rows[:5]:
+            parts = []
+            for col, val in row.items():
+                if val is None:
+                    continue
+                parts.append(f'{col}={val}')
+                if len(parts) >= 5:
+                    break
+            lines.append(f"- {'; '.join(parts) if parts else '(all null values)'}")
+    else:
+        lines.append('- No rows found')
+
+    for warning in result.get('warnings', []):
+        lines.append(f'Note: {warning}')
+    return lines
+
+
+def _mask_secret(value):
+    if value is None:
+        return None
+    txt = str(value)
+    if not txt:
+        return txt
+    if len(txt) <= 2:
+        return '*' * len(txt)
+    return txt[:2] + '*' * (len(txt) - 2)
+
+
+def fetch_client_server_map_details(instance_id, qa_only=False, max_rows=20):
+    conn, err = get_oracle_connection()
+    if err:
+        return {'table': 'CLIENT_SERVER_MAP', 'error': err}
+
+    try:
+        cur = conn.cursor()
+        column_info = _table_columns_info(cur, 'CLIENT_SERVER_MAP')
+        if not column_info:
+            return {'table': 'CLIENT_SERVER_MAP', 'error': 'CLIENT_SERVER_MAP is not accessible in current schema.'}
+
+        columns = [item['name'] for item in column_info]
+        where_clauses = []
+        bind_map = {}
+        warnings = []
+
+        instance_col = _pick_column(columns, ('INSTANCE_ID', 'INSTANCE', 'INST_ID', 'INSTANCE_NAME', 'CLIENT_INSTANCE_ID'))
+        qa_col = _pick_column(columns, ('SERVER_TYPE', 'ENVIRONMENT', 'SERVER_ENV', 'ENV', 'MAP_TYPE', 'SERVER_CATEGORY'))
+
+        if instance_col:
+            where_clauses.append(f"UPPER(TO_CHAR({instance_col})) = UPPER(:instance_id)")
+            bind_map['instance_id'] = instance_id
+        else:
+            warnings.append('No instance column found in CLIENT_SERVER_MAP; cannot filter by instance reliably.')
+
+        if qa_only and qa_col:
+            where_clauses.append(f"UPPER(TO_CHAR({qa_col})) LIKE '%QA%'")
+        elif qa_only and not qa_col:
+            warnings.append('No QA classifier column found in CLIENT_SERVER_MAP; QA filter not applied.')
+
+        where_sql = ' WHERE ' + ' AND '.join(where_clauses) if where_clauses else ''
+
+        required_cols = ['APP_SOURCE_PATH', 'DB_URL', 'DB_USER_NAME', 'DB_USER_PASSWORD']
+        selected_cols = [col for col in required_cols if col in columns]
+        missing_cols = [col for col in required_cols if col not in columns]
+        for col in missing_cols:
+            warnings.append(f'{col} column not found in CLIENT_SERVER_MAP.')
+
+        if not selected_cols:
+            return {
+                'table': 'CLIENT_SERVER_MAP',
+                'row_count': 0,
+                'rows': [],
+                'warnings': warnings + ['None of required columns are available in CLIENT_SERVER_MAP.'],
+            }
+
+        count_sql = f"SELECT COUNT(1) FROM CLIENT_SERVER_MAP{where_sql}"
+        cur.execute(count_sql, bind_map)
+        row_count = int(cur.fetchone()[0])
+
+        select_sql = (
+            f"SELECT {', '.join(selected_cols)} "
+            f"FROM CLIENT_SERVER_MAP{where_sql} "
+            f"FETCH FIRST {int(max_rows)} ROWS ONLY"
+        )
+        cur.execute(select_sql, bind_map)
+
+        rows = []
+        for raw in cur.fetchall():
+            row_map = {}
+            for idx, col in enumerate(selected_cols):
+                val = raw[idx]
+                if col == 'DB_USER_PASSWORD':
+                    row_map[col] = _mask_secret(val)
+                else:
+                    row_map[col] = str(val) if val is not None else None
+            rows.append(row_map)
+
+        return {
+            'table': 'CLIENT_SERVER_MAP',
+            'row_count': row_count,
+            'rows': rows,
+            'warnings': warnings,
+        }
+    except Exception as exc:
+        return {'table': 'CLIENT_SERVER_MAP', 'error': f'Query failed: {exc}'}
+    finally:
+        conn.close()
+
+
+def _render_client_server_map_details(result, title='CLIENT_SERVER_MAP'):
+    if result.get('error'):
+        return [f'{title}: {result["error"]}']
+
+    lines = [f'{title}: {result.get("row_count", 0)} row(s)']
+    rows = result.get('rows', [])
+    if not rows:
+        lines.append('- No rows found')
+    else:
+        for row in rows[:10]:
+            lines.append(f"- APP_SOURCE_PATH={row.get('APP_SOURCE_PATH')}")
+            lines.append(f"  DB_URL={row.get('DB_URL')}")
+            lines.append(f"  DB_USER_NAME={row.get('DB_USER_NAME')}")
+            lines.append(f"  DB_USER_PASSWORD={row.get('DB_USER_PASSWORD')}")
+
+    for warning in result.get('warnings', []):
+        lines.append(f'Note: {warning}')
+    lines.append('Note: DB_USER_PASSWORD is masked for security.')
+    return lines
+
+def fetch_instance_candidates(search_value):
+    conn, err = get_oracle_connection()
+    if err:
+        return {'error': err}
+
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                WITH param AS (
+                    SELECT :search_val AS val
+                    FROM dual
+                )
+                SELECT instance_id, grp_id, source_schema
+                FROM (
+                    SELECT CAST(instance_id AS VARCHAR2(200)) AS instance_id,
+                           CAST(grp_id AS VARCHAR2(200)) AS grp_id,
+                           'NEW SIMS' AS source_schema
+                    FROM SIM_ADMIN.INSTANCE_GRP_MAP
+                    UNION
+                    SELECT CAST(instance_id AS VARCHAR2(200)) AS instance_id,
+                           CAST(NULL AS VARCHAR2(200)) AS grp_id,
+                           'NEW SIMS' AS source_schema
+                    FROM SIM_ADMIN.VERSION_GROUP_MAP
+                    UNION
+                    SELECT CAST(instance_id AS VARCHAR2(200)) AS instance_id,
+                           CAST(NULL AS VARCHAR2(200)) AS grp_id,
+                           'OLD SIMS' AS source_schema
+                    FROM SIMS_NEW.VERSION_GROUP_MAP
+                ) merged_data
+                CROSS JOIN param p
+                WHERE LOWER(instance_id) LIKE '%' || LOWER(p.val) || '%'
+                ORDER BY instance_id
+                """,
+                {'search_val': search_value},
+            )
+            rows = cur.fetchall()
+        except Exception:
+            # Fallback when cross-schema access is restricted.
+            cur.execute(
+                """
+                SELECT DISTINCT INSTANCE_ID
+                FROM VERSION_GROUP_MAP
+                WHERE LOWER(INSTANCE_ID) LIKE '%' || LOWER(:search_val) || '%'
+                ORDER BY INSTANCE_ID
+                FETCH FIRST 100 ROWS ONLY
+                """,
+                {'search_val': search_value},
+            )
+            rows = [(r[0], None, 'CURRENT_SCHEMA') for r in cur.fetchall()]
+
+        candidates = []
+        seen = set()
+        for instance_id, grp_id, source_schema in rows:
+            if instance_id is None:
+                continue
+            key = instance_id.upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({
+                'instance_id': instance_id,
+                'grp_id': grp_id,
+                'source_schema': source_schema,
+            })
+
+        return {'search': search_value, 'candidates': candidates}
+    except Exception as exc:
+        return {'error': f'Query failed: {exc}'}
+    finally:
+        conn.close()
+
+
+def resolve_instance_choice(user_message, pending_instances):
+    text = (user_message or '').strip()
+    if not text or not pending_instances:
+        return None
+
+    if text.isdigit():
+        idx = int(text)
+        if 1 <= idx <= len(pending_instances):
+            return pending_instances[idx - 1]
+
+    for instance_id in pending_instances:
+        if text.upper() == instance_id.upper():
+            return instance_id
+
+    return None
+
+
+def _render_query_result(title, result, row_limit=20):
+    if result.get('error'):
+        return [f'{title}: {result["error"]}']
+
+    lines = [f'{title}: {result.get("row_count", 0)} row(s)']
+    rows = result.get('rows', [])
+    columns = result.get('columns', [])
+    if not rows:
+        lines.append('- No rows found')
+        return lines
+
+    for row in rows[:row_limit]:
+        parts = []
+        for col in columns[:8]:
+            value = row.get(col)
+            if value is not None:
+                parts.append(f'{col}={value}')
+        lines.append(f"- {'; '.join(parts) if parts else '(all null values)'}")
+
+    extra = result.get('row_count', len(rows)) - min(len(rows), row_limit)
+    if extra > 0:
+        lines.append(f'... {extra} more row(s) not shown')
+    return lines
+
+
+def _query_with_binds(sql, bind_map=None, max_rows=100):
+    conn, err = get_oracle_connection()
+    if err:
+        return {'error': err}
+
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, bind_map or {})
+        columns = [d[0] for d in cur.description] if cur.description else []
+
+        rows = []
+        row_count = 0
+        for raw in cur:
+            row_count += 1
+            if len(rows) < max_rows:
+                row_map = {}
+                for idx, col in enumerate(columns):
+                    val = raw[idx]
+                    row_map[col] = str(val) if val is not None else None
+                rows.append(row_map)
+
+        return {
+            'columns': columns,
+            'rows': rows,
+            'row_count': row_count,
+        }
+    except Exception as exc:
+        return {'error': f'Query failed: {exc}'}
+    finally:
+        conn.close()
+
+
+def _normalize_patch_no_text(value):
+    text = str(value or '').strip()
+    return text
+
+
+def _build_extra_patch_alert_lines(result, requested_patch_nos):
+    rows = result.get('rows', []) if isinstance(result, dict) else []
+    requested_set = {_normalize_patch_no_text(p) for p in (requested_patch_nos or []) if _normalize_patch_no_text(p)}
+    if not rows or not requested_set:
+        return []
+
+    grouped = {}
+    for row in rows:
+        request_no = _normalize_patch_no_text(row.get('REQUEST_NO'))
+        patch_no = _normalize_patch_no_text(row.get('PATCH_NO'))
+        client_id = _normalize_patch_no_text(row.get('CLIENT_ID')) or 'UNKNOWN'
+        code_desc = _normalize_patch_no_text(row.get('CODE_DESC')) or 'UNKNOWN'
+        key = (request_no or 'UNKNOWN', client_id, code_desc)
+
+        bucket = grouped.setdefault(
+            key,
+            {
+                'all': set(),
+                'requested': set(),
+                'extra': set(),
+            },
+        )
+
+        if patch_no:
+            bucket['all'].add(patch_no)
+            if patch_no in requested_set:
+                bucket['requested'].add(patch_no)
+            else:
+                bucket['extra'].add(patch_no)
+
+    alert_lines = []
+    for (request_no, client_id, code_desc), bucket in grouped.items():
+        if not bucket['extra']:
+            continue
+        requested_txt = ', '.join(sorted(bucket['requested'])) if bucket['requested'] else ', '.join(sorted(requested_set))
+        extra_txt = ', '.join(sorted(bucket['extra']))
+        alert_lines.append(
+            f"- Request No={request_no}; Client ID={client_id}; Code Desc={code_desc}; Input Patch={requested_txt}; Extra Patch={extra_txt}"
+        )
+
+    if not alert_lines:
+        return [
+            'Extra Patch Check: No extra patches found for the given Patch No, Client ID, and Code Desc.'
+        ]
+
+    return ['Extra Patch Check: Additional patch(es) found for the same Request/Client/Code Desc.'] + alert_lines
+
+
+def fetch_files_by_group_tag(instance_id, group_tag):
+    sql = """
+    SELECT *
+    FROM SIM_ADMIN.VERSIONHISTORY
+    WHERE SERIAL_NO IN (
+        SELECT SERIAL_NO
+        FROM SIM_ADMIN.VERSION_GROUP_MAP
+        WHERE GROUP_ID IN (:group_tag)
+    )
+      AND INSTANCE_ID = :instance_id
+    """
+    return _query_with_binds(sql, {'group_tag': group_tag, 'instance_id': instance_id})
+
+
+def fetch_files_by_patch_numbers(instance_id, patch_nos):
+    if not patch_nos:
+        return {'error': 'Patch number is required.'}
+
+    bind_map = {'instance_id': instance_id}
+    in_clause = _build_in_clause('patch', patch_nos, bind_map)
+    sql = f"""
+    SELECT vh.INSTANCE_ID,
+           pd.GROUP_ID,
+           pd.PATCH_SEQ_NO,
+           pd.PATCH_NO,
+           vh.FILENAME,
+           vh.PROJECT_PATH,
+           pd.PATCH_DESC
+    FROM SIM_ADMIN.PATCH_DETAILS pd
+    JOIN SIM_ADMIN.VERSION_GROUP_MAP vgm
+      ON pd.GROUP_ID = vgm.GROUP_ID
+    JOIN SIM_ADMIN.VERSIONHISTORY vh
+      ON vgm.SERIAL_NO = vh.SERIAL_NO
+    WHERE vh.INSTANCE_ID LIKE '%' || :instance_id || '%'
+      AND pd.GROUP_ID LIKE '%' || :instance_id || '%'
+      AND TO_CHAR(pd.PATCH_NO) IN ({in_clause})
+    ORDER BY pd.PATCH_SEQ_NO DESC
+    """
+    return _query_with_binds(sql, bind_map)
+
+
+def fetch_req_patch_stage_details(instance_id, patch_nos, stage_code):
+    if not patch_nos:
+        return {'error': 'Patch number is required.'}
+
+    bind_map = {
+        'instance_id': instance_id,
+        'stage_code': stage_code,
+    }
+    in_clause = _build_in_clause('patch', patch_nos, bind_map)
+
+    sql = f"""
+    SELECT pdf.instance_id,
+           pi.request_no,
+           pi.patch_no,
+           cd.code_desc,
+           pdf.deploy_status,
+           pdf.client_id,
+           TO_CHAR(pdf.create_tstamp) AS create_tstamp,
+           TO_CHAR(pdf.deploy_possible_tstamp) AS deploy_possible_tstamp,
+           TO_CHAR(pdf.deployed_tstamp) AS deployed_tstamp
+    FROM patch_deployment_info pdf
+    LEFT OUTER JOIN codes_dtl cd
+      ON cd.code_id = pdf.stage
+     AND cd.code_type = 'PATCH_STATUS'
+    JOIN patch_info pi
+      ON pdf.request_no = pi.request_no
+     AND pdf.instance_id = pi.instance_id
+    WHERE pdf.stage = :stage_code
+      AND pdf.instance_id = :instance_id
+      AND pdf.request_no IN (
+            SELECT request_no
+            FROM patch_info
+            WHERE instance_id = :instance_id
+              AND TO_CHAR(patch_no) IN ({in_clause})
+      )
+    ORDER BY pdf.stage
+    """
+    return _query_with_binds(sql, bind_map)
+
+
+def fetch_file_release_patches(instance_id, filename_pattern):
+    sql = """
+    SELECT DISTINCT vh.serial_no,
+           vh.filename,
+           vh.project_path,
+           vh.revision_no,
+           gm.group_id,
+           vh.patch_no
+    FROM versionhistory vh,
+         version_group_map gm
+    WHERE vh.serial_no = gm.serial_no
+      AND vh.instance_id = gm.instance_id(+)
+      AND gm.instance_id IN (:instance_id)
+      AND UPPER(vh.filename) LIKE UPPER('%' || :filename_pattern || '%')
+    ORDER BY vh.serial_no DESC
+    """
+    return _query_with_binds(sql, {'instance_id': instance_id, 'filename_pattern': filename_pattern})
+
+
+def fetch_group_tag_owner(group_tag):
+    sql = """
+    SELECT user_name
+    FROM user_profile
+    WHERE user_id IN (
+        SELECT modify_user
+        FROM sim_admin.version_group_map
+        WHERE group_id = :group_tag
+    )
+    """
+    return _query_with_binds(sql, {'group_tag': group_tag})
+
+
+def fetch_stage_reference():
+    sql = """
+    SELECT code_id, code_desc
+    FROM codes_dtl
+    WHERE code_type = 'PATCH_STATUS'
+    ORDER BY TO_NUMBER(code_id)
+    """
+    return _query_with_binds(sql, max_rows=500)
+
+
+def fetch_test_deployment_pending():
+    sql = """
+    SELECT DISTINCT TRUNC(G.CREATE_TSTAMP) AS DATE_VALUE,
+           G.INSTANCE_ID,
+           G.GROUP_ID,
+           DEV.USER_NAME AS GROUPED_BY,
+           R.STATUS,
+           R.VERSION_TAKEN_BY
+    FROM VERSION_GROUP_MAP G
+    LEFT OUTER JOIN (
+        SELECT B.GROUP_TAG,
+               CD.CODE_DESC AS STATUS,
+               VC.USER_NAME AS VERSION_TAKEN_BY
+        FROM BUILD_DTL B,
+             (SELECT GROUP_TAG, MAX(BUILD_SEQ_NO) AS BUILD_NO
+              FROM BUILD_DTL
+              WHERE GROUP_TAG IN (
+                  SELECT DISTINCT GROUP_ID
+                  FROM VERSION_GROUP_MAP VGM
+                  WHERE DEPLOYED_STATUS='N'
+                    AND INSTANCE_ID NOT IN ('IRS_DEV','IRS','DOMS_NEW','SONY2-OPM')
+                    AND TRUNC(CREATE_TSTAMP)>=TRUNC(SYSDATE)-30
+              )
+              GROUP BY GROUP_TAG) D,
+             USER_PROFILE VC,
+             CODES_DTL CD
+        WHERE B.GROUP_TAG = D.GROUP_TAG
+          AND B.BUILD_SEQ_NO = D.BUILD_NO
+          AND B.CREATE_USER = VC.USER_ID
+          AND CD.CODE_TYPE='BD_STATUS_CD'
+          AND B.STATUS_CD=CD.CODE_ID
+    ) R
+      ON G.GROUP_ID = R.GROUP_TAG,
+      USER_PROFILE DEV
+    WHERE G.DEPLOYED_STATUS='N'
+      AND G.CREATE_USER = DEV.USER_ID
+      AND G.INSTANCE_ID NOT IN ('S7TEC','BROOKS6P2379','S73DIB','S71SONYAUS','CASEYSWCS','S73ALND','S7FB','UPSHC','DOMSUMG71P210','S241P40CH','S241P61ACT','NFIS6P2566','UPSPDZNP5994','S73TEKTON','SCFLEX242','SCP7_CORE','SCP7_BASE','DOMS241','S232P16SOS','S74MP112JAS','S241P12ITS','S242P6SFB','S242DSW','SCFLEX241')
+      AND TRUNC(G.CREATE_TSTAMP)>=(SYSDATE)-150
+    ORDER BY TRUNC(G.CREATE_TSTAMP) DESC
+    """
+    return _query_with_binds(sql, max_rows=500)
+
+
+def fetch_auto_patch_extracted():
+    sql = """
+    SELECT DISTINCT TO_CHAR(p.create_tstamp) AS patch_date,
+           p.instance_id,
+           p.group_id,
+           p.patch_seq_no,
+           p.patch_no,
+           p.patch_after_stamp_no,
+           p.build_by,
+           p.patch_status
+    FROM patch_details p
+    WHERE p.patch_status = 'EXTRACTED'
+      AND TRUNC(p.modify_tstamp) >= (SYSDATE) - 30
+    ORDER BY p.patch_seq_no DESC
+    """
+    return _query_with_binds(sql, max_rows=500)
+
+
+
+def _empty_query_result(columns=None):
+    return {'columns': columns or [], 'rows': [], 'row_count': 0}
+
+
+def fetch_patch_seq_flow(patch_seq_no):
+    instance_from_seq, patch_type, seq_part = parse_patch_seq_parts(patch_seq_no)
+
+    patch_details_sql = """
+    SELECT INSTANCE_ID, GROUP_ID, PATCH_NO, PATCH_SEQ_NO
+    FROM PATCH_DETAILS
+    WHERE PATCH_SEQ_NO = :patch_seq_no
+    """
+    patch_details_result = _query_with_binds(
+        patch_details_sql,
+        {'patch_seq_no': patch_seq_no},
+        max_rows=200,
+    )
+    if patch_details_result.get('error'):
+        return {'error': patch_details_result['error']}
+
+    rows = patch_details_result.get('rows', [])
+    instance_id = None
+    for row in rows:
+        if row.get('INSTANCE_ID'):
+            instance_id = row.get('INSTANCE_ID')
+            break
+    if not instance_id:
+        instance_id = instance_from_seq
+
+    group_ids = sorted({row.get('GROUP_ID') for row in rows if row.get('GROUP_ID')})
+
+    patch_no_set = set()
+    for row in rows:
+        raw_patch_no = row.get('PATCH_NO')
+        if raw_patch_no is None:
+            continue
+        normalized_patch_no = str(raw_patch_no).strip()
+        if not normalized_patch_no:
+            continue
+        if normalized_patch_no.upper() in ('NULL', 'N/A', '-'):
+            continue
+        patch_no_set.add(normalized_patch_no)
+    patch_nos = sorted(patch_no_set)
+    versionhistory_result = _empty_query_result()
+    if instance_id and group_ids:
+        bind_map = {'instance_id': instance_id}
+        in_clause = _build_in_clause('gid', group_ids, bind_map)
+        versionhistory_sql = f"""
+        SELECT *
+        FROM VERSIONHISTORY
+        WHERE SERIAL_NO IN (
+            SELECT SERIAL_NO
+            FROM VERSION_GROUP_MAP
+            WHERE GROUP_ID IN ({in_clause})
+        )
+          AND INSTANCE_ID = :instance_id
+        """
+        versionhistory_result = _query_with_binds(versionhistory_sql, bind_map, max_rows=300)
+
+    patch_build_log_result = _empty_query_result(['PATCH_EXTRACT_FLAG', 'BUILD_START'])
+    if not patch_nos:
+        build_log_sql = """
+        SELECT PATCH_EXTRACT_FLAG, BUILD_START
+        FROM PATCH_BUILD_LOG
+        WHERE PATCH_SEQ_NO = :patch_seq_no
+        """
+        patch_build_log_result = _query_with_binds(
+            build_log_sql,
+            {'patch_seq_no': patch_seq_no},
+            max_rows=50,
+        )
+
+    return {
+        'patch_seq_no': patch_seq_no,
+        'instance_id': instance_id,
+        'instance_from_seq': instance_from_seq,
+        'patch_type': patch_type,
+        'seq_part': seq_part,
+        'group_ids': group_ids,
+        'patch_nos': patch_nos,
+        'patch_details': patch_details_result,
+        'versionhistory': versionhistory_result,
+        'patch_build_log': patch_build_log_result,
+    }
+
+def _resolve_stage_display(stage_code):
+    if not stage_code:
+        return 'UNKNOWN'
+    for name, code in STAGE_NAME_TO_CODE.items():
+        if code == stage_code:
+            return name
+    return stage_code
+
+
+def _normalize_status_value(status):
+    value = str(status or '').strip()
+    return value if value else 'UNKNOWN'
+
+
+def _coerce_excel_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+
+    text = str(value or '').strip()
+    if not text:
+        return None
+
+    for fmt in ('%d-%m-%Y', '%d/%m/%Y', '%Y-%m-%d', '%m/%d/%Y', '%d.%m.%Y'):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _find_sheet_row_for_today(sheet, today):
+    for row in sheet.iter_rows(min_row=1, values_only=True):
+        row_date = _coerce_excel_date(row[0] if row else None)
+        if row_date == today:
+            return row
+    return None
+
+
+def _sheet_value(row, index):
+    if not row or len(row) <= index or row[index] is None:
+        return 'N/A'
+    text = str(row[index]).strip()
+    return text if text else 'N/A'
+
+
+def _sort_shift_person_names(value):
+    text = str(value or '').strip()
+    if not text or text == 'N/A':
+        return 'N/A'
+
+    separators = [',', '/', ';']
+    delimiter = next((sep for sep in separators if sep in text), None)
+    if not delimiter:
+        return text
+
+    parts = [part.strip() for part in text.split(delimiter) if part.strip()]
+    if len(parts) <= 1:
+        return text
+
+    return f'{delimiter} '.join(sorted(parts, key=str.casefold))
+
+
+def _format_display_date(value, fallback_date):
+    parsed = _coerce_excel_date(value)
+    if parsed:
+        return parsed.strftime('%d-%b-%Y')
+    text = str(value or '').strip()
+    if text:
+        return text
+    return fallback_date.strftime('%d-%b-%Y')
+
+
+def fetch_vc_shift_details(target_date=None):
+    today = target_date or date.today()
+    data = {
+        'error': None,
+        'date_display': today.strftime('%d-%b-%Y'),
+        'day_display': today.strftime('%A'),
+        'eight_oclock': 'N/A',
+        'ten_oclock': 'N/A',
+        'general': 'N/A',
+        'second_shift': 'N/A',
+        'night_shift': 'N/A',
+        'reviewer': 'N/A',
+        'reviewer_available': today.weekday() < 5,
+    }
+
+    if load_workbook is None:
+        data['error'] = 'openpyxl is not installed. Install it to read WFH_Shift_Plan.xlsx.'
+        return data
+
+    if not os.path.isfile(SHIFT_PLAN_FILE):
+        data['error'] = f'Shift plan file not found: {SHIFT_PLAN_FILE}'
+        return data
+
+    workbook = None
+    try:
+        workbook = load_workbook(SHIFT_PLAN_FILE, data_only=True)
+
+        if 'VC_Shift_Plan' not in workbook.sheetnames or 'Reviewer_Plan' not in workbook.sheetnames:
+            data['error'] = 'Required sheets VC_Shift_Plan and Reviewer_Plan are not available in WFH_Shift_Plan.xlsx.'
+            return data
+
+        vc_sheet = workbook['VC_Shift_Plan']
+        reviewer_sheet = workbook['Reviewer_Plan']
+
+        vc_row = _find_sheet_row_for_today(vc_sheet, today)
+        reviewer_row = _find_sheet_row_for_today(reviewer_sheet, today)
+
+        source_row = vc_row if vc_row else reviewer_row
+        if source_row:
+            data['date_display'] = _format_display_date(source_row[0], today)
+            day_value = _sheet_value(source_row, 1)
+            data['day_display'] = day_value if day_value != 'N/A' else today.strftime('%A')
+
+        if vc_row:
+            data['eight_oclock'] = _sheet_value(vc_row, 2)
+            data['ten_oclock'] = _sheet_value(vc_row, 3)
+            data['general'] = _sort_shift_person_names(_sheet_value(vc_row, 4))
+            data['second_shift'] = _sheet_value(vc_row, 5)
+            data['night_shift'] = _sheet_value(vc_row, 6)
+
+        if today.weekday() >= 5:
+            data['reviewer_available'] = False
+            data['reviewer'] = 'Reviewer not available on weekends'
+        elif reviewer_row:
+            data['reviewer'] = _sheet_value(reviewer_row, 2)
+
+        if not vc_row and not reviewer_row and not data['error']:
+            data['error'] = f'No shift data available for {today.strftime("%d-%b-%Y")}. Please update WFH_Shift_Plan.xlsx.'
+
+        return data
+    except Exception as exc:
+        data['error'] = f'Unable to load shift plans: {exc}'
+        return data
+    finally:
+        if workbook is not None:
+            workbook.close()
+
+
+def _render_vc_shift_chat_response(vc_shift):
+    lines = ['VC Shift Plan:']
+    if vc_shift.get('error'):
+        lines.append(vc_shift['error'])
+        return '\n'.join(lines)
+
+    lines.append(f"Date: {vc_shift.get('date_display', 'N/A')} ({vc_shift.get('day_display', 'N/A')})")
+    lines.append(f"Mrng shift person: {vc_shift.get('eight_oclock', 'N/A')}")
+    lines.append(f"10'o clk shift person: {vc_shift.get('ten_oclock', 'N/A')}")
+    lines.append(f"General shift person: {vc_shift.get('general', 'N/A')}")
+    lines.append(f"Second shift person: {vc_shift.get('second_shift', 'N/A')}")
+    lines.append(f"Night shift person: {vc_shift.get('night_shift', 'N/A')}")
+
+    if vc_shift.get('reviewer_available'):
+        lines.append(
+            f"Reviewer: {vc_shift.get('date_display', 'N/A')} and {vc_shift.get('day_display', 'N/A')} reviewer is {vc_shift.get('reviewer', 'N/A')}"
+        )
+    else:
+        lines.append('Reviewer: Reviewer not available on weekends')
+
+    return '\n'.join(lines)
+
+def _handle_pending_input(message, pending_input, active_instance):
+    if not pending_input:
+        return None, active_instance, None
+
+    intent = pending_input.get('intent')
+    instance_id = pending_input.get('instance_id') or active_instance
+
+    if intent == 'files_group':
+        group_tag = extract_group_tag(message)
+        if not group_tag:
+            return 'Please provide Group Tag (example: DOMS261-0394).', active_instance, pending_input
+
+        result = fetch_files_by_group_tag(instance_id, group_tag)
+        lines = [f'Instance ID: {instance_id}', f'Group Tag: {group_tag}']
+        lines.extend(_render_query_result('Files In Group Tag', result))
+        return '\n'.join(lines), instance_id, None
+
+    if intent == 'files_patch':
+        patch_nos = parse_instance_and_patches(message)[1]
+        if not patch_nos:
+            return 'Please provide Patch No (single or comma-separated).', active_instance, pending_input
+
+        result = fetch_files_by_patch_numbers(instance_id, patch_nos)
+        lines = [f'Instance ID: {instance_id}', f'Patch No: {", ".join(patch_nos)}']
+        lines.extend(_render_query_result('Files In Patch', result))
+        return '\n'.join(lines), instance_id, None
+
+    if intent in ('req_extra', 'deployment_stage'):
+        patch_nos = pending_input.get('patch_nos')
+        stage_code = pending_input.get('stage_code')
+
+        if not patch_nos:
+            patch_nos = parse_instance_and_patches(message)[1]
+            if not patch_nos:
+                return 'Please provide Patch No (single or comma-separated).', active_instance, pending_input
+            pending_input['patch_nos'] = patch_nos
+            return 'Provide Stage (example: UAT, PROD, or stage number like 20/40).', active_instance, pending_input
+
+        if not stage_code:
+            stage_code = extract_stage_code(message)
+            if not stage_code:
+                return 'Provide valid Stage (UAT, PROD, QA, DEV-UAT, or stage number).', active_instance, pending_input
+            pending_input['stage_code'] = stage_code
+
+        result = fetch_req_patch_stage_details(instance_id, patch_nos, stage_code)
+        title = 'Ensure Req No Extra Patches' if intent == 'req_extra' else 'Deployment Request'
+        lines = [
+            f'Instance ID: {instance_id}',
+            f'Patch No: {", ".join(patch_nos)}',
+            f'Stage: {_resolve_stage_display(stage_code)} ({stage_code})',
+        ]
+        lines.extend(_render_query_result(title, result))
+        lines.extend(_build_extra_patch_alert_lines(result, patch_nos))
+        return '\n'.join(lines), instance_id, None
+
+    if intent == 'file_release':
+        filename_pattern = extract_filename_pattern(message) or (message or '').strip()
+        if not filename_pattern:
+            return 'Please provide file name pattern.', active_instance, pending_input
+
+        result = fetch_file_release_patches(instance_id, filename_pattern)
+        lines = [f'Instance ID: {instance_id}', f'Filename Pattern: {filename_pattern}']
+        lines.extend(_render_query_result('File Released In Patches', result))
+        return '\n'.join(lines), instance_id, None
+
+    if intent == 'group_owner':
+        group_tag = extract_group_tag(message)
+        if not group_tag:
+            return 'Please provide Group Tag.', active_instance, pending_input
+
+        result = fetch_group_tag_owner(group_tag)
+        lines = [f'Group Tag: {group_tag}']
+        lines.extend(_render_query_result('Group Tag Given By', result))
+        return '\n'.join(lines), instance_id, None
+
+    return None, active_instance, None
+
+def fetch_patch_numbers_for_instance(instance_id):
+    conn, err = get_oracle_connection()
+    if err:
+        return {'error': err}
+
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT TO_CHAR(PATCH_NO) AS PATCH_NO
+            FROM PATCH_DETAILS
+            WHERE INSTANCE_ID = :instance_id
+            ORDER BY PATCH_NO DESC
+            FETCH FIRST 100 ROWS ONLY
+            """,
+            {'instance_id': instance_id},
+        )
+        patch_nos = [row[0] for row in cur.fetchall() if row[0] is not None]
+        return {'instance_id': instance_id, 'patch_nos': patch_nos}
+    except Exception as exc:
+        return {'error': f'Query failed: {exc}'}
+    finally:
+        conn.close()
+
+
+def fetch_group_tags_for_instance(instance_id):
+    conn, err = get_oracle_connection()
+    if err:
+        return {'error': err}
+
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT GROUP_ID
+            FROM VERSION_GROUP_MAP
+            WHERE INSTANCE_ID = :instance_id
+              AND GROUP_ID IS NOT NULL
+            ORDER BY GROUP_ID DESC
+            FETCH FIRST 100 ROWS ONLY
+            """,
+            {'instance_id': instance_id},
+        )
+        group_ids = [row[0] for row in cur.fetchall() if row[0] is not None]
+        return {'instance_id': instance_id, 'group_ids': group_ids}
+    except Exception as exc:
+        return {'error': f'Query failed: {exc}'}
+    finally:
+        conn.close()
+
+
+def fetch_patch_owner(instance_id, patch_no):
+    conn, err = get_oracle_connection()
+    if err:
+        return {'error': err}
+
+    try:
+        cur = conn.cursor()
+        patch_cols = _table_columns(cur, 'PATCH_DETAILS')
+        user_cols = _table_columns(cur, 'USER_PROFILE')
+
+        if not patch_cols:
+            return {'error': 'PATCH_DETAILS is not accessible in current schema.'}
+        if not user_cols:
+            return {'error': 'USER_PROFILE is not accessible in current schema.'}
+
+        build_candidates = [
+            col for col in patch_cols
+            if col in ('BUILD_BY', 'BUILT_BY', 'BUILD_USER', 'BUILD_USER_ID')
+        ]
+        if not build_candidates:
+            build_candidates = [col for col in patch_cols if 'BUILD' in col]
+        if not build_candidates:
+            return {'error': 'No BUILD BY style column found in PATCH_DETAILS.'}
+
+        build_col = build_candidates[0]
+
+        cur.execute(
+            f"""
+            SELECT {build_col}
+            FROM PATCH_DETAILS
+            WHERE INSTANCE_ID = :instance_id
+              AND TO_CHAR(PATCH_NO) = :patch_no
+            """,
+            {'instance_id': instance_id, 'patch_no': patch_no},
+        )
+        builder_ids = sorted({row[0] for row in cur.fetchall() if row[0] is not None})
+
+        if not builder_ids:
+            return {
+                'instance_id': instance_id,
+                'patch_no': patch_no,
+                'build_column': build_col,
+                'builder_ids': [],
+                'builder_names': {},
+            }
+
+        if 'USER_ID' not in user_cols or 'USER_NAME' not in user_cols:
+            return {
+                'instance_id': instance_id,
+                'patch_no': patch_no,
+                'build_column': build_col,
+                'builder_ids': builder_ids,
+                'builder_names': {},
+                'warning': 'USER_PROFILE is missing USER_ID or USER_NAME columns.',
+            }
+
+        bind_map = {}
+        in_clause = _build_in_clause('uid', builder_ids, bind_map)
+        cur.execute(
+            f"""
+            SELECT USER_ID, USER_NAME
+            FROM USER_PROFILE
+            WHERE USER_ID IN ({in_clause})
+            """,
+            bind_map,
+        )
+        builder_names = {row[0]: row[1] for row in cur.fetchall()}
+
+        return {
+            'instance_id': instance_id,
+            'patch_no': patch_no,
+            'build_column': build_col,
+            'builder_ids': builder_ids,
+            'builder_names': builder_names,
+        }
+    except Exception as exc:
+        return {'error': f'Query failed: {exc}'}
+    finally:
+        conn.close()
+
+
+def fetch_patch_details(instance_id, patch_no):
+    conn, err = get_oracle_connection()
+    if err:
+        return {'error': err}
+
+    try:
+        cur = conn.cursor()
+
+        # Keep file-list flow minimal to avoid timezone conversion issues in thin mode.
+        cur.execute(
+            """
+            SELECT PATCH_NO, GROUP_ID
+            FROM PATCH_DETAILS
+            WHERE TO_CHAR(PATCH_NO) = :patch_no
+              AND INSTANCE_ID = :instance_id
+            """,
+            {'patch_no': patch_no, 'instance_id': instance_id},
+        )
+        patch_rows = cur.fetchall()
+        group_ids = sorted({row[1] for row in patch_rows if row[1] is not None})
+
+        serial_nos = []
+        if group_ids:
+            bind_map = {'instance_id': instance_id}
+            in_clause = _build_in_clause('gid', group_ids, bind_map)
+            cur.execute(
+                f"""
+                SELECT SERIAL_NO
+                FROM VERSION_GROUP_MAP
+                WHERE INSTANCE_ID = :instance_id
+                  AND GROUP_ID IN ({in_clause})
+                """,
+                bind_map,
+            )
+            serial_nos = sorted({row[0] for row in cur.fetchall() if row[0] is not None})
+
+        filenames = []
+        if serial_nos:
+            bind_map = {'instance_id': instance_id}
+            in_clause = _build_in_clause('sid', serial_nos, bind_map)
+            cur.execute(
+                f"""
+                SELECT FILENAME
+                FROM VERSIONHISTORY
+                WHERE INSTANCE_ID = :instance_id
+                  AND SERIAL_NO IN ({in_clause})
+                ORDER BY FILENAME
+                """,
+                bind_map,
+            )
+            filenames = [row[0] for row in cur.fetchall() if row[0]]
+
+        return {
+            'instance_id': instance_id,
+            'patch_no': patch_no,
+            'group_ids': group_ids,
+            'serial_nos': serial_nos,
+            'filenames': filenames,
+            'unique_filenames': sorted(set(filenames)),
+        }
+    except Exception as exc:
+        return {'error': f'Query failed: {exc}'}
+    finally:
+        conn.close()
+
+
+def build_chat_response(message, active_instance=None, skip_instance_resolution=False):
+    text = (message or '').strip()
+    parsed_instance, patch_nos = parse_instance_and_patches(text)
+    instance_ref = parse_instance_reference(text)
+    patch_seq_no = extract_patch_seq_no(text)
+
+    if skip_instance_resolution:
+        resolved_instance = active_instance
+        pending = None
+    else:
+        provided_instance = None if patch_seq_no else (parsed_instance or instance_ref)
+        pending = None
+        resolved_instance = active_instance
+
+        if provided_instance:
+            search_result = fetch_instance_candidates(provided_instance)
+            if search_result.get('error'):
+                return search_result['error'], active_instance, None, None
+
+            candidates = search_result['candidates']
+            if not candidates:
+                return f'No instance found for "{provided_instance}".', active_instance, None, None
+
+            ids = [item['instance_id'] for item in candidates]
+            exact = [iid for iid in ids if iid.upper() == provided_instance.upper()]
+            unique_ids = []
+            seen = set()
+            for iid in ids:
+                key = iid.upper()
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique_ids.append(iid)
+
+            if exact:
+                resolved_instance = exact[0]
+            elif len(unique_ids) == 1:
+                resolved_instance = unique_ids[0]
+            else:
+                lines = [f'Multiple instance IDs found for "{provided_instance}". Please choose one:']
+                for idx, iid in enumerate(unique_ids, start=1):
+                    lines.append(f'{idx}. {iid}')
+                lines.append('Reply with number or exact instance ID.')
+                pending = {'instances': unique_ids, 'message': text}
+                return '\n'.join(lines), active_instance, pending, None
+
+    if is_stage_reference_request(text):
+        stage_result = fetch_stage_reference()
+        lines = ['Patch Status Stages:']
+        lines.extend(_render_query_result('CODES_DTL', stage_result, row_limit=40))
+        return '\n'.join(lines), resolved_instance, None, None
+
+    if is_test_deployment_pending_request(text):
+        result = fetch_test_deployment_pending()
+        lines = ['Test Deployment Pending (last 150 days):']
+        lines.extend(_render_query_result('TEST_DEPLOYMENT', result))
+        return '\n'.join(lines), resolved_instance, None, None
+
+    if is_auto_patch_extracted_request(text):
+        result = fetch_auto_patch_extracted()
+        lines = ['Auto Patch Extracted (last 30 days):']
+        lines.extend(_render_query_result('AUTO_PATCH', result))
+        return '\n'.join(lines), resolved_instance, None, None
+
+    if is_vc_shift_request(text):
+        vc_shift = fetch_vc_shift_details()
+        return _render_vc_shift_chat_response(vc_shift), resolved_instance, None, None
+
+
+    if patch_seq_no:
+        seq_result = fetch_patch_seq_flow(patch_seq_no)
+        if seq_result.get('error'):
+            return seq_result['error'], resolved_instance, None, None
+
+        if seq_result.get('instance_id'):
+            resolved_instance = seq_result['instance_id']
+
+        lines = [
+            f'Patch Seq No: {patch_seq_no}',
+            f'Instance: {seq_result.get("instance_id") or seq_result.get("instance_from_seq") or "N/A"}',
+        ]
+
+        if seq_result.get('group_ids'):
+            lines.append(f'Group Tag(s): {", ".join(seq_result["group_ids"])}')
+
+        version_rows = seq_result.get('versionhistory', {}).get('rows', [])
+        unique_files = []
+        seen_files = set()
+        for row in version_rows:
+            name = row.get('FILENAME')
+            if not name:
+                continue
+            key = name.upper()
+            if key in seen_files:
+                continue
+            seen_files.add(key)
+            unique_files.append(name)
+
+        lines.append('Filename:')
+        if unique_files:
+            for name in unique_files[:50]:
+                lines.append(name)
+        else:
+            lines.append('No files found')
+
+        patch_nos = seq_result.get('patch_nos') or []
+        if patch_nos:
+            lines.append(f'Patch No(s): {", ".join(patch_nos)}')
+        else:
+            log_rows = seq_result.get('patch_build_log', {}).get('rows', [])
+            build_start = None
+            patch_extract_flag = None
+            if log_rows:
+                latest = log_rows[0]
+                build_start = latest.get('BUILD_START')
+                patch_extract_flag = latest.get('PATCH_EXTRACT_FLAG')
+
+            if build_start is not None or patch_extract_flag is not None:
+                lines.append(
+                    f'Patch No(s):  (BUILD_START={build_start or "N/A"} and PATCH_EXTRACT_FLAG={patch_extract_flag or "N/A"})'
+                )
+            else:
+                lines.append('Patch No(s):  (BUILD_START=N/A and PATCH_EXTRACT_FLAG=N/A)')
+        return '\n'.join(lines), resolved_instance, None, None
+
+    if resolved_instance and is_instance_only_message(text, resolved_instance):
+        prompt = [
+            f'Instance ID set to: {resolved_instance}',
+            'What do you want next?',
+            '- Files in Group Tag',
+            '- Files in Patch No',
+            '- Ensure Req No Extra Patches',
+            '- Deployment Request',
+            '- File released in what patches',
+            '- Group tag given by',
+            '- Stage reference',
+            '- Test deployment pending',
+            '- Auto patch extracted',
+            '- VC shift plan / Reviewer plan',
+            '- Patch no list / Group tags / Who took patch',
+        ]
+        return '\n'.join(prompt), resolved_instance, None, None
+
+    instance_id = resolved_instance
+
+    if is_group_tag_owner_request(text):
+        group_tag = extract_group_tag(text)
+        if not group_tag:
+            return 'Provide Group Tag.', instance_id, None, {'intent': 'group_owner', 'instance_id': instance_id}
+
+        result = fetch_group_tag_owner(group_tag)
+        lines = [f'Group Tag: {group_tag}']
+        lines.extend(_render_query_result('Group Tag Given By', result))
+        return '\n'.join(lines), instance_id, None, None
+
+    if not instance_id:
+        return 'Please provide an Instance ID first.', active_instance, None, None
+
+    if is_files_in_group_tag_request(text):
+        group_tag = extract_group_tag(text)
+        if not group_tag:
+            return f'Instance ID: {instance_id}\nProvide Group Tag (example: DOMS261-0394).', instance_id, None, {'intent': 'files_group', 'instance_id': instance_id}
+
+        result = fetch_files_by_group_tag(instance_id, group_tag)
+        lines = [f'Instance ID: {instance_id}', f'Group Tag: {group_tag}']
+        lines.extend(_render_query_result('Files In Group Tag', result))
+        return '\n'.join(lines), instance_id, None, None
+
+    if is_files_in_patch_request(text):
+        if not patch_nos:
+            return f'Instance ID: {instance_id}\nProvide Patch No (single or comma-separated).', instance_id, None, {'intent': 'files_patch', 'instance_id': instance_id}
+
+        result = fetch_files_by_patch_numbers(instance_id, patch_nos)
+        lines = [f'Instance ID: {instance_id}', f'Patch No: {", ".join(patch_nos)}']
+        lines.extend(_render_query_result('Files In Patch', result))
+        return '\n'.join(lines), instance_id, None, None
+
+    if is_req_extra_patch_request(text):
+        if not patch_nos:
+            return f'Instance ID: {instance_id}\nProvide Patch No (single or comma-separated).', instance_id, None, {'intent': 'req_extra', 'instance_id': instance_id}
+
+        stage_code = extract_stage_code(text)
+        if not stage_code:
+            return f'Instance ID: {instance_id}\nPatch No: {", ".join(patch_nos)}\nProvide Stage (UAT, PROD, etc).', instance_id, None, {'intent': 'req_extra', 'instance_id': instance_id, 'patch_nos': patch_nos}
+
+        result = fetch_req_patch_stage_details(instance_id, patch_nos, stage_code)
+        lines = [f'Instance ID: {instance_id}', f'Patch No: {", ".join(patch_nos)}', f'Stage: {_resolve_stage_display(stage_code)} ({stage_code})']
+        lines.extend(_render_query_result('Ensure Req No Extra Patches', result))
+        lines.extend(_build_extra_patch_alert_lines(result, patch_nos))
+        return '\n'.join(lines), instance_id, None, None
+
+    if is_deployment_request_by_stage(text):
+        if not patch_nos:
+            return f'Instance ID: {instance_id}\nProvide Patch No (single or comma-separated).', instance_id, None, {'intent': 'deployment_stage', 'instance_id': instance_id}
+
+        stage_code = extract_stage_code(text)
+        if not stage_code:
+            return f'Instance ID: {instance_id}\nPatch No: {", ".join(patch_nos)}\nProvide Stage (UAT, PROD, etc).', instance_id, None, {'intent': 'deployment_stage', 'instance_id': instance_id, 'patch_nos': patch_nos}
+
+        result = fetch_req_patch_stage_details(instance_id, patch_nos, stage_code)
+        lines = [f'Instance ID: {instance_id}', f'Patch No: {", ".join(patch_nos)}', f'Stage: {_resolve_stage_display(stage_code)} ({stage_code})']
+        lines.extend(_render_query_result('Deployment Request', result))
+        lines.extend(_build_extra_patch_alert_lines(result, patch_nos))
+        return '\n'.join(lines), instance_id, None, None
+
+    if is_file_release_patch_request(text):
+        filename_pattern = extract_filename_pattern(text)
+        if not filename_pattern:
+            return f'Instance ID: {instance_id}\nProvide file name (example: AcceptSSCCLeftAutomationProcess.java).', instance_id, None, {'intent': 'file_release', 'instance_id': instance_id}
+
+        result = fetch_file_release_patches(instance_id, filename_pattern)
+        lines = [f'Instance ID: {instance_id}', f'Filename Pattern: {filename_pattern}']
+        lines.extend(_render_query_result('File Released In Patches', result))
+        return '\n'.join(lines), instance_id, None, None
+
+    need_consolidation = is_consolidation_request(text) or is_all_details_request(text)
+    need_qa = is_qa_server_request(text) or is_all_details_request(text)
+    need_deployment = is_deployment_request(text) or is_all_details_request(text)
+
+    if need_consolidation or need_qa or need_deployment:
+        lines = [f'Instance ID: {instance_id}']
+
+        if need_consolidation:
+            lines.append('')
+            lines.extend(_render_table_excerpt(fetch_table_details('CLIENT_SERVER_INSTANCE_DTL', instance_id=instance_id), 'CLIENT_SERVER_INSTANCE_DTL'))
+
+        if need_qa:
+            lines.append('')
+            qa_result = fetch_client_server_map_details(instance_id=instance_id, qa_only=True)
+            if not qa_result.get('error') and qa_result.get('row_count', 0) == 0:
+                fallback_result = fetch_client_server_map_details(instance_id=instance_id, qa_only=False)
+                if not fallback_result.get('error') and fallback_result.get('row_count', 0) > 0:
+                    fallback_result.setdefault('warnings', []).append('No rows matched QA keyword filter; showing all CLIENT_SERVER_MAP rows for this instance.')
+                    qa_result = fallback_result
+            lines.extend(_render_client_server_map_details(qa_result, 'CLIENT_SERVER_MAP (QA)'))
+
+        if need_deployment:
+            deployment_patches = patch_nos or [None]
+            for patch_no in deployment_patches:
+                lines.append('')
+                lines.append('Deployment details (instance level):' if patch_no is None else f'Deployment details for patch {patch_no}:')
+                lines.extend(_render_table_excerpt(fetch_table_details('PATCH_DEPLOYMENT_INFO', instance_id=instance_id, patch_no=patch_no), 'PATCH_DEPLOYMENT_INFO'))
+                lines.extend(_render_table_excerpt(fetch_table_details('PATCH_INFO', instance_id=instance_id, patch_no=patch_no), 'PATCH_INFO'))
+
+        return '\n'.join(lines).strip(), instance_id, None, None
+
+    if is_patch_owner_question(text):
+        if not patch_nos:
+            return f'Instance ID: {instance_id}\nPlease provide patch number(s) for owner lookup.', instance_id, None, None
+
+        lines = [f'Instance ID: {instance_id}']
+        for patch_no in patch_nos:
+            owner_result = fetch_patch_owner(instance_id, patch_no)
+            if owner_result.get('error'):
+                lines.append(f'Patch {patch_no}: {owner_result["error"]}')
+                lines.append('')
+                continue
+
+            lines.append(f'Patch No: {patch_no}')
+            lines.append(f'Build Column: {owner_result["build_column"]}')
+
+            if not owner_result['builder_ids']:
+                lines.append('Patch Taken By: not found in PATCH_DETAILS')
+                lines.append('')
+                continue
+
+            lines.append('Patch Taken By:')
+            for builder_id in owner_result['builder_ids']:
+                name = owner_result['builder_names'].get(builder_id)
+                lines.append(f'- {builder_id} : {name}' if name else f'- {builder_id} : name not found in USER_PROFILE')
+            lines.append('')
+
+        return '\n'.join(lines).strip(), instance_id, None, None
+
+    if is_patch_list_request(text) and not patch_nos:
+        patch_result = fetch_patch_numbers_for_instance(instance_id)
+        if patch_result.get('error'):
+            return patch_result['error'], instance_id, None, None
+        if not patch_result['patch_nos']:
+            return f'Instance ID: {instance_id}\nNo patch numbers found.', instance_id, None, None
+
+        lines = [f'Instance ID: {instance_id}', f'Patch Nos ({len(patch_result["patch_nos"])}):']
+        for patch_no in patch_result['patch_nos']:
+            lines.append(f'- {patch_no}')
+        return '\n'.join(lines), instance_id, None, None
+
+    if is_group_tags_request(text) and not patch_nos:
+        tag_result = fetch_group_tags_for_instance(instance_id)
+        if tag_result.get('error'):
+            return tag_result['error'], instance_id, None, None
+        if not tag_result['group_ids']:
+            return f'Instance ID: {instance_id}\nNo group tags found.', instance_id, None, None
+
+        lines = [f'Instance ID: {instance_id}', f'Group Tags ({len(tag_result["group_ids"])}):']
+        for gid in tag_result['group_ids']:
+            lines.append(f'- {gid}')
+        return '\n'.join(lines), instance_id, None, None
+
+    if not patch_nos:
+        return f'Instance ID: {instance_id}\nTell me what you need: files in group tag, files in patch, request/deployment by stage, file release patch trace, group tag owner, patch no list, group tags, who took patch, stage reference, test deployment pending, auto patch extracted, or vc shift plan.', instance_id, None, None
+
+    lines = [f'Instance ID: {instance_id}']
+    for patch_no in patch_nos:
+        result = fetch_patch_details(instance_id, patch_no)
+        if result.get('error'):
+            lines.append(f'Patch {patch_no}: {result["error"]}')
+            lines.append('')
+            continue
+
+        if not result['group_ids']:
+            lines.append(f'Patch {patch_no}: No PATCH_DETAILS row found.')
+            lines.append('')
+            continue
+
+        lines.append(f'Patch No: {patch_no}')
+        lines.append(f'Group IDs: {", ".join(result["group_ids"])}')
+        lines.append(f'Serial Nos: {len(result["serial_nos"])}')
+        lines.append(f'Filenames ({len(result["filenames"])} rows, {len(result["unique_filenames"])} unique):')
+        if result['unique_filenames']:
+            for name in result['unique_filenames']:
+                lines.append(f'- {name}')
+        else:
+            lines.append('- No filenames found in VERSIONHISTORY')
+        lines.append('')
+
+    return '\n'.join(lines).strip(), instance_id, None, None
+def get_db():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with get_db() as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS links (
+                id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT    NOT NULL,
+                link TEXT    NOT NULL
+            )
+        ''')
+        conn.commit()
+
+
+@app.route('/', methods=['GET', 'POST'])
+def login():
+    if 'user' in session:
+        return redirect(url_for('dashboard'))
+
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '').strip()
+
+        if username == DEFAULT_USERNAME and password == DEFAULT_PASSWORD:
+            session['user'] = username
+            flash('Login successful!', 'success')
+            return redirect(url_for('dashboard'))
+        else:
+            flash('Invalid username or password.', 'danger')
+
+    return render_template('login.html')
+
+
+@app.route('/logout')
+def logout():
+    session.pop('user', None)
+    flash('You have been logged out.', 'info')
+    return redirect(url_for('login'))
+
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    with get_db() as conn:
+        records = conn.execute('SELECT id, name, link FROM links ORDER BY id DESC').fetchall()
+
+    regular_records = []
+    for record in records:
+        record_name = (record['name'] or '').strip().upper()
+        record_link = (record['link'] or '').strip().upper()
+        is_auto_patch = record_name == 'AUTO_PATCH' or record_link == 'AUTO_PATCH'
+        is_test_deployment = record_name == 'TEST_DEPLOYMENT' or record_link == 'TEST_DEPLOYMENT'
+        if is_auto_patch or is_test_deployment:
+            continue
+        regular_records.append(record)
+
+    vc_shift = fetch_vc_shift_details()
+    return render_template('dashboard.html', records=regular_records, vc_shift=vc_shift)
+
+
+@app.route('/api/vc-shift/next-day')
+@login_required
+def api_vc_shift_next_day():
+    next_day = date.today() + timedelta(days=1)
+    return jsonify(fetch_vc_shift_details(target_date=next_day))
+
+
+@app.route('/add', methods=['GET', 'POST'])
+@login_required
+def add_record():
+    if request.method == 'POST':
+        name = request.form.get('name', '').strip()
+        link = request.form.get('link', '').strip()
+
+        if not name or not link:
+            flash('Both Name and Link are required.', 'danger')
+            return render_template('add_record.html')
+
+        with get_db() as conn:
+            conn.execute('INSERT INTO links (name, link) VALUES (?, ?)', (name, link))
+            conn.commit()
+
+        flash(f'Record "{name}" added successfully!', 'success')
+        return redirect(url_for('dashboard'))
+
+    return render_template('add_record.html')
+
+
+@app.route('/edit/<int:record_id>', methods=['GET', 'POST'])
+@login_required
+def edit_record(record_id):
+    with get_db() as conn:
+        row = conn.execute('SELECT id, name, link FROM links WHERE id = ?', (record_id,)).fetchone()
+        if not row:
+            flash('Record not found.', 'danger')
+            return redirect(url_for('dashboard'))
+
+        if request.method == 'POST':
+            name = request.form.get('name', '').strip()
+            link = request.form.get('link', '').strip()
+            if not name or not link:
+                flash('Both Name and Link are required.', 'danger')
+                return render_template('edit_record.html', record=row)
+            conn.execute('UPDATE links SET name = ?, link = ? WHERE id = ?', (name, link, record_id))
+            conn.commit()
+            flash(f'Record "{name}" updated successfully!', 'success')
+            return redirect(url_for('dashboard'))
+
+    return render_template('edit_record.html', record=row)
+
+
+@app.route('/run/<int:record_id>')
+@login_required
+def run_record(record_id):
+    """Execute a local file path or route special records to reports."""
+    with get_db() as conn:
+        row = conn.execute('SELECT name, link FROM links WHERE id = ?', (record_id,)).fetchone()
+
+    if not row:
+        flash('Record not found.', 'danger')
+        return redirect(url_for('dashboard'))
+
+    record_name = (row['name'] or '').strip().upper()
+    record_link = (row['link'] or '').strip().upper()
+    if record_name == 'AUTO_PATCH' or record_link == 'AUTO_PATCH':
+        return redirect(url_for('auto_patch_report'))
+    if record_name == 'TEST_DEPLOYMENT' or record_link == 'TEST_DEPLOYMENT':
+        return redirect(url_for('test_deployment_report'))
+
+    path = row['link']
+    # Only allow absolute Windows paths to prevent arbitrary command injection
+    if not re.match(r'^[A-Za-z]:\\', path):
+        flash('This link is not a local file path.', 'danger')
+        return redirect(url_for('dashboard'))
+
+    if not os.path.isfile(path):
+        flash(f'File not found: {path}', 'danger')
+        return redirect(url_for('dashboard'))
+
+    # Use cmd /c start so Windows picks the right handler (e.g. wscript for .vbs)
+    subprocess.Popen(['cmd', '/c', 'start', '', path], shell=False)
+    flash(f'"{row["name"]}" launched successfully.', 'success')
+    return redirect(url_for('dashboard'))
+
+
+@app.route('/reports/auto-patch')
+@login_required
+def auto_patch_report():
+    embedded = request.args.get('embedded') == '1'
+    result = fetch_auto_patch_extracted()
+    if result.get('error'):
+        flash(result['error'], 'danger')
+        return render_template(
+            'auto_patch_report.html',
+            embedded=embedded,
+            error=result['error'],
+            row_count=0,
+            rows=[],
+            pie_labels=[],
+            pie_values=[],
+            scatter_points=[],
+        )
+
+    rows = result.get('rows', [])
+    pie_counter = Counter()
+    scatter_points = []
+
+    for item in rows:
+        instance_id = item.get('INSTANCE_ID') or 'UNKNOWN'
+        patch_seq_no = item.get('PATCH_SEQ_NO')
+        patch_no = item.get('PATCH_NO')
+        pie_counter[instance_id] += 1
+
+        try:
+            seq_value = float(patch_seq_no)
+            patch_value = float(patch_no) if patch_no is not None else None
+            if patch_value is not None:
+                scatter_points.append({
+                    'x': seq_value,
+                    'y': patch_value,
+                    'instance': instance_id,
+                    'patch_no': str(patch_no),
+                })
+        except (TypeError, ValueError):
+            continue
+
+    pie_labels = list(pie_counter.keys())
+    pie_values = [pie_counter[k] for k in pie_labels]
+
+    return render_template(
+        'auto_patch_report.html',
+        embedded=embedded,
+        error=None,
+        row_count=result.get('row_count', len(rows)),
+        rows=rows,
+        pie_labels=pie_labels,
+        pie_values=pie_values,
+        scatter_points=scatter_points,
+    )
+
+
+@app.route('/reports/test-deployment')
+@login_required
+def test_deployment_report():
+    embedded = request.args.get('embedded') == '1'
+    result = fetch_test_deployment_pending()
+    if result.get('error'):
+        flash(result['error'], 'danger')
+        return render_template(
+            'test_deployment_report.html',
+            embedded=embedded,
+            error=result['error'],
+            row_count=0,
+            rows=[],
+            instance_labels=[],
+            instance_values=[],
+            status_labels=[],
+            status_values=[],
+        )
+
+    rows = result.get('rows', [])
+    instance_counter = Counter()
+    status_counter = Counter()
+    for item in rows:
+        instance_counter[item.get('INSTANCE_ID') or 'UNKNOWN'] += 1
+        status_counter[_normalize_status_value(item.get('STATUS'))] += 1
+
+    return render_template(
+        'test_deployment_report.html',
+        embedded=embedded,
+        error=None,
+        row_count=result.get('row_count', len(rows)),
+        rows=rows,
+        instance_labels=list(instance_counter.keys()),
+        instance_values=[instance_counter[k] for k in instance_counter.keys()],
+        status_labels=list(status_counter.keys()),
+        status_values=[status_counter[k] for k in status_counter.keys()],
+    )
+
+
+@app.route('/delete/<int:record_id>', methods=['POST'])
+@login_required
+def delete_record(record_id):
+    with get_db() as conn:
+        row = conn.execute('SELECT name FROM links WHERE id = ?', (record_id,)).fetchone()
+        if row:
+            conn.execute('DELETE FROM links WHERE id = ?', (record_id,))
+            conn.commit()
+            flash(f'Record "{row["name"]}" deleted successfully!', 'success')
+        else:
+            flash('Record not found.', 'danger')
+
+    return redirect(url_for('dashboard'))
+
+
+def process_chat_message(message):
+    history = session.get('chat_history', [])
+    active_instance = session.get('chat_instance_id')
+    pending_instances = session.get('chat_pending_instances')
+    pending_message = session.get('chat_pending_message')
+    pending_input = session.get('chat_pending_input')
+
+    bot_text = ''
+    if message:
+        history.append({'role': 'user', 'text': message})
+
+        # VC shift/reviewer queries should work without instance context.
+        if is_vc_shift_request(message):
+            session.pop('chat_pending_instances', None)
+            session.pop('chat_pending_message', None)
+            session.pop('chat_pending_input', None)
+            bot_text = _render_vc_shift_chat_response(fetch_vc_shift_details())
+            history.append({'role': 'assistant', 'text': bot_text})
+            history = history[-20:]
+            session['chat_history'] = history
+            if active_instance:
+                session['chat_instance_id'] = active_instance
+            else:
+                session.pop('chat_instance_id', None)
+            return bot_text, history
+
+        if pending_input:
+            bot_text, active_instance, next_pending_input = _handle_pending_input(message, pending_input, active_instance)
+            if next_pending_input:
+                session['chat_pending_input'] = next_pending_input
+            else:
+                session.pop('chat_pending_input', None)
+
+            if bot_text is None:
+                bot_text, active_instance, pending, pending_input_next = build_chat_response(message, active_instance)
+                if pending:
+                    session['chat_pending_instances'] = pending['instances']
+                    session['chat_pending_message'] = pending['message']
+                if pending_input_next:
+                    session['chat_pending_input'] = pending_input_next
+
+        elif pending_instances:
+            selected = resolve_instance_choice(message, pending_instances)
+            if selected:
+                active_instance = selected
+                session.pop('chat_pending_instances', None)
+                session.pop('chat_pending_message', None)
+
+                if pending_message:
+                    follow_text, active_instance, pending, pending_input_next = build_chat_response(
+                        pending_message,
+                        active_instance,
+                        skip_instance_resolution=True,
+                    )
+                    bot_text = f'Instance selected: {active_instance}\n{follow_text}'
+                    if pending:
+                        session['chat_pending_instances'] = pending['instances']
+                        session['chat_pending_message'] = pending['message']
+                    if pending_input_next:
+                        session['chat_pending_input'] = pending_input_next
+                else:
+                    bot_text = (
+                        f'Instance ID set to: {active_instance}\n'
+                        'What do you want next?\n'
+                        '- Files in Group Tag\n'
+                        '- Files in Patch No\n'
+                        '- Ensure Req No Extra Patches\n'
+                        '- Deployment Request\n'
+                        '- File released in what patches\n'
+                        '- Group tag given by\n'
+                        '- Stage reference\n'
+                        '- Test deployment pending\n'
+                        '- Auto patch extracted\n'
+                        '- VC shift plan / Reviewer plan'
+                    )
+            else:
+                lines = ['Please choose a valid instance by number or exact ID:']
+                for idx, iid in enumerate(pending_instances, start=1):
+                    lines.append(f'{idx}. {iid}')
+                bot_text = '\n'.join(lines)
+
+        else:
+            bot_text, active_instance, pending, pending_input_next = build_chat_response(message, active_instance)
+            if pending:
+                session['chat_pending_instances'] = pending['instances']
+                session['chat_pending_message'] = pending['message']
+            if pending_input_next:
+                session['chat_pending_input'] = pending_input_next
+            else:
+                session.pop('chat_pending_input', None)
+
+        history.append({'role': 'assistant', 'text': bot_text})
+        history = history[-20:]
+        session['chat_history'] = history
+        if active_instance:
+            session['chat_instance_id'] = active_instance
+        else:
+            session.pop('chat_instance_id', None)
+
+    return bot_text, history
+
+
+@app.route('/chatbot', methods=['GET', 'POST'])
+@login_required
+def chatbot():
+    history = session.get('chat_history', [])
+
+    if request.method == 'POST':
+        message = request.form.get('message', '').strip()
+        if message:
+            process_chat_message(message)
+            history = session.get('chat_history', history)
+
+    return render_template('chatbot.html', history=history)
+
+
+@app.route('/chatbot/message', methods=['POST'])
+@login_required
+def chatbot_message():
+    data = request.get_json(silent=True) or {}
+    message = str(data.get('message', '')).strip()
+    if not message:
+        return jsonify({'ok': False, 'error': 'Message is required.'}), 400
+
+    reply, _ = process_chat_message(message)
+    return jsonify({'ok': True, 'reply': reply})
+
+
+@app.route('/chatbot/clear', methods=['POST'])
+@login_required
+def clear_chatbot():
+    session.pop('chat_history', None)
+    session.pop('chat_instance_id', None)
+    session.pop('chat_pending_instances', None)
+    session.pop('chat_pending_message', None)
+    flash('Chat history cleared.', 'info')
+    session.pop('chat_pending_input', None)
+    return redirect(url_for('chatbot'))
+
+
+if __name__ == '__main__':
+    init_db()
+    debug_mode = os.getenv('FLASK_DEBUG', '0').strip() in ('1', 'true', 'TRUE', 'yes', 'YES')
+    port = int(os.getenv('PORT', '5000'))
+    app.run(host='0.0.0.0', port=port, debug=debug_mode)
+
+
+

@@ -1,0 +1,1163 @@
+import os
+import re
+import sqlite3
+import subprocess
+from functools import wraps
+from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
+try:
+    import oracledb
+except ImportError:
+    oracledb = None
+
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+
+# Jinja filter so templates can check if a link is a local Windows path
+app.jinja_env.filters['regex_search'] = lambda value, pattern: bool(re.match(pattern, value))
+
+DATABASE = os.path.join(os.path.dirname(__file__), 'database.db')
+
+DEFAULT_USERNAME = 'admin'
+DEFAULT_PASSWORD = 'admin@123'
+
+ORACLE_DEFAULT_USER = 'sim_admin'
+ORACLE_DEFAULT_HOST = '192.1.2.45'
+ORACLE_DEFAULT_PORT = '1521'
+ORACLE_DEFAULT_SERVICE = 'ptsdbin'
+
+
+def login_required(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if 'user' not in session:
+            return redirect(url_for('login'))
+        return view_func(*args, **kwargs)
+
+    return wrapped
+
+
+def parse_instance_and_patches(message):
+    text = (message or '').strip()
+
+    patch_numbers = []
+    patch_anchor = re.search(r'patch(?:\s*no)?\s*[:=\-]?\s*([0-9,\s]+)', text, re.IGNORECASE)
+    if patch_anchor:
+        patch_numbers = re.findall(r'\d+', patch_anchor.group(1))
+    if not patch_numbers:
+        patch_numbers = re.findall(r'\b\d+\b', text)
+
+    dedup_patches = []
+    seen = set()
+    for patch in patch_numbers:
+        if patch not in seen:
+            seen.add(patch)
+            dedup_patches.append(patch)
+
+    instance_match = re.search(
+        r'instance(?:\s*id)?\s*[:=\-]?\s*([A-Za-z0-9_\-]+)',
+        text,
+        re.IGNORECASE,
+    )
+    if not instance_match:
+        instance_match = re.search(r'\b(?:of|for|in)\s+([A-Za-z][A-Za-z0-9_\-]+)\b', text, re.IGNORECASE)
+
+    instance_id = instance_match.group(1).upper() if instance_match else None
+    return instance_id, dedup_patches
+
+
+def parse_instance_reference(message):
+    text = (message or '').strip()
+    match = re.search(r'instance(?:\s*id)?\s*[:=\-]?\s*([A-Za-z0-9_\-]+)', text, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+
+    single = re.fullmatch(r'[A-Za-z][A-Za-z0-9_\-]*', text)
+    if single:
+        return text.upper()
+
+    tail = re.search(r'\b(?:of|for|in)\s+([A-Za-z][A-Za-z0-9_\-]+)\b\s*$', text, re.IGNORECASE)
+    if tail:
+        return tail.group(1).upper()
+    return None
+
+
+def is_instance_only_message(message, instance_id):
+    text = (message or '').strip()
+    lower = text.lower()
+    if any(token in lower for token in ('patch', 'file', 'group', 'tag', 'who', 'build', 'taken', 'take')):
+        return False
+
+    if text.upper() == instance_id:
+        return True
+
+    return bool(re.fullmatch(r'instance(?:\s*id)?\s*[:=\-]?\s*[A-Za-z0-9_\-]+', text, re.IGNORECASE))
+
+
+def is_patch_owner_question(message):
+    text = (message or '').lower()
+    return 'who' in text and 'patch' in text and any(token in text for token in ('take', 'took', 'taken', 'build', 'built'))
+
+
+def is_patch_list_request(message):
+    text = (message or '').lower()
+    return 'patch no' in text or 'patch number' in text or text.strip() in ('patch', 'patches')
+
+
+def is_group_tags_request(message):
+    text = (message or '').lower()
+    return 'group tag' in text or 'group tags' in text or 'group id' in text or text.strip() in ('group', 'groups')
+
+
+
+def is_consolidation_request(message):
+    text = (message or '').lower()
+    return any(token in text for token in ('consolidation', 'client_server_instance_dtl', 'instance detail'))
+
+
+def is_qa_server_request(message):
+    text = (message or '').lower()
+    return any(token in text for token in ('qa server', 'qa details', 'client_server_map'))
+
+
+def is_deployment_request(message):
+    text = (message or '').lower()
+    return any(token in text for token in ('deployment', 'deploy req', 'patch deployment', 'patch info'))
+
+
+def is_all_details_request(message):
+    text = (message or '').lower()
+    return any(token in text for token in ('all details', 'complete details', 'full details', 'everything'))
+
+def _get_windows_user_env(name):
+    if os.name != 'nt' or winreg is None:
+        return None
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Environment') as key:
+            value, _ = winreg.QueryValueEx(key, name)
+            return value.strip() if isinstance(value, str) else value
+    except OSError:
+        return None
+
+
+def get_oracle_connection():
+    if oracledb is None:
+        return None, 'Python package "oracledb" is not installed. Install it with: python -m pip install oracledb'
+
+    oracle_user = os.getenv('ORACLE_USER', ORACLE_DEFAULT_USER)
+    oracle_password = os.getenv('ORACLE_PASSWORD') or _get_windows_user_env('ORACLE_PASSWORD')
+    oracle_host = os.getenv('ORACLE_HOST', ORACLE_DEFAULT_HOST)
+    oracle_port = os.getenv('ORACLE_PORT', ORACLE_DEFAULT_PORT)
+    oracle_service = os.getenv('ORACLE_SERVICE', ORACLE_DEFAULT_SERVICE)
+
+    if not oracle_password:
+        return None, 'ORACLE_PASSWORD is not set. Set it in your terminal before starting the app.'
+
+    dsn = f'{oracle_host}:{oracle_port}/{oracle_service}'
+    try:
+        conn = oracledb.connect(user=oracle_user, password=oracle_password, dsn=dsn)
+        return conn, None
+    except Exception as exc:
+        return None, f'Oracle connection failed: {exc}'
+
+
+def _build_in_clause(bind_prefix, values, bind_map):
+    placeholders = []
+    for idx, value in enumerate(values):
+        key = f'{bind_prefix}{idx}'
+        bind_map[key] = value
+        placeholders.append(f':{key}')
+    return ', '.join(placeholders)
+
+
+def _table_columns(cursor, table_name):
+    cursor.execute(
+        """
+        SELECT column_name
+        FROM user_tab_columns
+        WHERE table_name = :table_name
+        ORDER BY column_id
+        """,
+        {'table_name': table_name},
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+
+
+def _table_columns_info(cursor, table_name):
+    cursor.execute(
+        """
+        SELECT column_name, data_type
+        FROM user_tab_columns
+        WHERE table_name = :table_name
+        ORDER BY column_id
+        """,
+        {'table_name': table_name},
+    )
+    return [{'name': row[0], 'type': row[1]} for row in cursor.fetchall()]
+
+
+def _pick_column(columns, candidates):
+    for candidate in candidates:
+        if candidate in columns:
+            return candidate
+    return None
+
+
+def fetch_table_details(table_name, instance_id=None, patch_no=None, qa_only=False, max_rows=8):
+    conn, err = get_oracle_connection()
+    if err:
+        return {'table': table_name, 'error': err}
+
+    try:
+        cur = conn.cursor()
+        table_name = table_name.upper()
+        column_info = _table_columns_info(cur, table_name)
+        if not column_info:
+            return {'table': table_name, 'error': f'{table_name} is not accessible in current schema.'}
+
+        columns = [item['name'] for item in column_info]
+        where_clauses = []
+        bind_map = {}
+        warnings = []
+
+        instance_col = _pick_column(columns, ('INSTANCE_ID', 'INSTANCE', 'INST_ID', 'INSTANCE_NAME', 'CLIENT_INSTANCE_ID'))
+        patch_col = _pick_column(columns, ('PATCH_NO', 'PATCH_NUMBER', 'PATCH_ID', 'PATCHID'))
+        qa_col = _pick_column(columns, ('SERVER_TYPE', 'ENVIRONMENT', 'SERVER_ENV', 'ENV', 'MAP_TYPE', 'SERVER_CATEGORY'))
+
+        if instance_id:
+            if instance_col:
+                where_clauses.append(f"UPPER(TO_CHAR({instance_col})) = UPPER(:instance_id)")
+                bind_map['instance_id'] = instance_id
+            else:
+                warnings.append('No instance column found; instance filter not applied.')
+
+        if patch_no:
+            if patch_col:
+                where_clauses.append(f"TO_CHAR({patch_col}) = :patch_no")
+                bind_map['patch_no'] = str(patch_no)
+            else:
+                warnings.append('No patch column found; patch filter not applied.')
+
+        if qa_only:
+            if qa_col:
+                where_clauses.append(f"UPPER(TO_CHAR({qa_col})) LIKE '%QA%'")
+            else:
+                warnings.append('No QA classifier column found; QA filter not applied.')
+
+        where_sql = ' WHERE ' + ' AND '.join(where_clauses) if where_clauses else ''
+
+        count_sql = f"SELECT COUNT(1) FROM {table_name}{where_sql}"
+        cur.execute(count_sql, bind_map)
+        row_count = int(cur.fetchone()[0])
+
+        safe_select_cols = [item['name'] for item in column_info if 'TIME ZONE' not in (item['type'] or '').upper()]
+        if not safe_select_cols:
+            safe_select_cols = columns
+        safe_select_cols = safe_select_cols[:12]
+
+        select_sql = (
+            f"SELECT {', '.join(safe_select_cols)} FROM {table_name}{where_sql} FETCH FIRST {int(max_rows)} ROWS ONLY"
+        )
+        cur.execute(select_sql, bind_map)
+
+        result_rows = []
+        for row in cur.fetchall():
+            row_map = {}
+            for idx, col in enumerate(safe_select_cols):
+                value = row[idx]
+                row_map[col] = str(value) if value is not None else None
+            result_rows.append(row_map)
+
+        return {
+            'table': table_name,
+            'row_count': row_count,
+            'columns': safe_select_cols,
+            'rows': result_rows,
+            'warnings': warnings,
+            'filters': {
+                'instance_column': instance_col,
+                'patch_column': patch_col,
+                'qa_column': qa_col if qa_only else None,
+            },
+        }
+    except Exception as exc:
+        return {'table': table_name, 'error': f'Query failed: {exc}'}
+    finally:
+        conn.close()
+
+
+def _render_table_excerpt(result, title=None):
+    table_name = title or result.get('table', 'TABLE')
+    if result.get('error'):
+        return [f'{table_name}: {result["error"]}']
+
+    lines = [f'{table_name}: {result["row_count"]} row(s)']
+    rows = result.get('rows', [])
+    if rows:
+        for row in rows[:5]:
+            parts = []
+            for col, val in row.items():
+                if val is None:
+                    continue
+                parts.append(f'{col}={val}')
+                if len(parts) >= 5:
+                    break
+            lines.append(f"- {'; '.join(parts) if parts else '(all null values)'}")
+    else:
+        lines.append('- No rows found')
+
+    for warning in result.get('warnings', []):
+        lines.append(f'Note: {warning}')
+    return lines
+
+
+def _mask_secret(value):
+    if value is None:
+        return None
+    txt = str(value)
+    if not txt:
+        return txt
+    if len(txt) <= 2:
+        return '*' * len(txt)
+    return txt[:2] + '*' * (len(txt) - 2)
+
+
+def fetch_client_server_map_details(instance_id, qa_only=False, max_rows=20):
+    conn, err = get_oracle_connection()
+    if err:
+        return {'table': 'CLIENT_SERVER_MAP', 'error': err}
+
+    try:
+        cur = conn.cursor()
+        column_info = _table_columns_info(cur, 'CLIENT_SERVER_MAP')
+        if not column_info:
+            return {'table': 'CLIENT_SERVER_MAP', 'error': 'CLIENT_SERVER_MAP is not accessible in current schema.'}
+
+        columns = [item['name'] for item in column_info]
+        where_clauses = []
+        bind_map = {}
+        warnings = []
+
+        instance_col = _pick_column(columns, ('INSTANCE_ID', 'INSTANCE', 'INST_ID', 'INSTANCE_NAME', 'CLIENT_INSTANCE_ID'))
+        qa_col = _pick_column(columns, ('SERVER_TYPE', 'ENVIRONMENT', 'SERVER_ENV', 'ENV', 'MAP_TYPE', 'SERVER_CATEGORY'))
+
+        if instance_col:
+            where_clauses.append(f"UPPER(TO_CHAR({instance_col})) = UPPER(:instance_id)")
+            bind_map['instance_id'] = instance_id
+        else:
+            warnings.append('No instance column found in CLIENT_SERVER_MAP; cannot filter by instance reliably.')
+
+        if qa_only and qa_col:
+            where_clauses.append(f"UPPER(TO_CHAR({qa_col})) LIKE '%QA%'")
+        elif qa_only and not qa_col:
+            warnings.append('No QA classifier column found in CLIENT_SERVER_MAP; QA filter not applied.')
+
+        where_sql = ' WHERE ' + ' AND '.join(where_clauses) if where_clauses else ''
+
+        required_cols = ['APP_SOURCE_PATH', 'DB_URL', 'DB_USER_NAME', 'DB_USER_PASSWORD']
+        selected_cols = [col for col in required_cols if col in columns]
+        missing_cols = [col for col in required_cols if col not in columns]
+        for col in missing_cols:
+            warnings.append(f'{col} column not found in CLIENT_SERVER_MAP.')
+
+        if not selected_cols:
+            return {
+                'table': 'CLIENT_SERVER_MAP',
+                'row_count': 0,
+                'rows': [],
+                'warnings': warnings + ['None of required columns are available in CLIENT_SERVER_MAP.'],
+            }
+
+        count_sql = f"SELECT COUNT(1) FROM CLIENT_SERVER_MAP{where_sql}"
+        cur.execute(count_sql, bind_map)
+        row_count = int(cur.fetchone()[0])
+
+        select_sql = (
+            f"SELECT {', '.join(selected_cols)} "
+            f"FROM CLIENT_SERVER_MAP{where_sql} "
+            f"FETCH FIRST {int(max_rows)} ROWS ONLY"
+        )
+        cur.execute(select_sql, bind_map)
+
+        rows = []
+        for raw in cur.fetchall():
+            row_map = {}
+            for idx, col in enumerate(selected_cols):
+                val = raw[idx]
+                if col == 'DB_USER_PASSWORD':
+                    row_map[col] = _mask_secret(val)
+                else:
+                    row_map[col] = str(val) if val is not None else None
+            rows.append(row_map)
+
+        return {
+            'table': 'CLIENT_SERVER_MAP',
+            'row_count': row_count,
+            'rows': rows,
+            'warnings': warnings,
+        }
+    except Exception as exc:
+        return {'table': 'CLIENT_SERVER_MAP', 'error': f'Query failed: {exc}'}
+    finally:
+        conn.close()
+
+
+def _render_client_server_map_details(result, title='CLIENT_SERVER_MAP'):
+    if result.get('error'):
+        return [f'{title}: {result["error"]}']
+
+    lines = [f'{title}: {result.get("row_count", 0)} row(s)']
+    rows = result.get('rows', [])
+    if not rows:
+        lines.append('- No rows found')
+    else:
+        for row in rows[:10]:
+            lines.append(f"- APP_SOURCE_PATH={row.get('APP_SOURCE_PATH')}")
+            lines.append(f"  DB_URL={row.get('DB_URL')}")
+            lines.append(f"  DB_USER_NAME={row.get('DB_USER_NAME')}")
+            lines.append(f"  DB_USER_PASSWORD={row.get('DB_USER_PASSWORD')}")
+
+    for warning in result.get('warnings', []):
+        lines.append(f'Note: {warning}')
+    lines.append('Note: DB_USER_PASSWORD is masked for security.')
+    return lines
+
+def fetch_instance_candidates(search_value):
+    conn, err = get_oracle_connection()
+    if err:
+        return {'error': err}
+
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                WITH param AS (
+                    SELECT :search_val AS val
+                    FROM dual
+                )
+                SELECT instance_id, grp_id, source_schema
+                FROM (
+                    SELECT CAST(instance_id AS VARCHAR2(200)) AS instance_id,
+                           CAST(grp_id AS VARCHAR2(200)) AS grp_id,
+                           'NEW SIMS' AS source_schema
+                    FROM SIM_ADMIN.INSTANCE_GRP_MAP
+                    UNION
+                    SELECT CAST(instance_id AS VARCHAR2(200)) AS instance_id,
+                           CAST(NULL AS VARCHAR2(200)) AS grp_id,
+                           'NEW SIMS' AS source_schema
+                    FROM SIM_ADMIN.VERSION_GROUP_MAP
+                    UNION
+                    SELECT CAST(instance_id AS VARCHAR2(200)) AS instance_id,
+                           CAST(NULL AS VARCHAR2(200)) AS grp_id,
+                           'OLD SIMS' AS source_schema
+                    FROM SIMS_NEW.VERSION_GROUP_MAP
+                ) merged_data
+                CROSS JOIN param p
+                WHERE LOWER(instance_id) LIKE '%' || LOWER(p.val) || '%'
+                ORDER BY instance_id
+                """,
+                {'search_val': search_value},
+            )
+            rows = cur.fetchall()
+        except Exception:
+            # Fallback when cross-schema access is restricted.
+            cur.execute(
+                """
+                SELECT DISTINCT INSTANCE_ID
+                FROM VERSION_GROUP_MAP
+                WHERE LOWER(INSTANCE_ID) LIKE '%' || LOWER(:search_val) || '%'
+                ORDER BY INSTANCE_ID
+                FETCH FIRST 100 ROWS ONLY
+                """,
+                {'search_val': search_value},
+            )
+            rows = [(r[0], None, 'CURRENT_SCHEMA') for r in cur.fetchall()]
+
+        candidates = []
+        seen = set()
+        for instance_id, grp_id, source_schema in rows:
+            if instance_id is None:
+                continue
+            key = instance_id.upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({
+                'instance_id': instance_id,
+                'grp_id': grp_id,
+                'source_schema': source_schema,
+            })
+
+        return {'search': search_value, 'candidates': candidates}
+    except Exception as exc:
+        return {'error': f'Query failed: {exc}'}
+    finally:
+        conn.close()
+
+
+def resolve_instance_choice(user_message, pending_instances):
+    text = (user_message or '').strip()
+    if not text or not pending_instances:
+        return None
+
+    if text.isdigit():
+        idx = int(text)
+        if 1 <= idx <= len(pending_instances):
+            return pending_instances[idx - 1]
+
+    for instance_id in pending_instances:
+        if text.upper() == instance_id.upper():
+            return instance_id
+
+    return None
+
+
+def fetch_patch_numbers_for_instance(instance_id):
+    conn, err = get_oracle_connection()
+    if err:
+        return {'error': err}
+
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT TO_CHAR(PATCH_NO) AS PATCH_NO
+            FROM PATCH_DETAILS
+            WHERE INSTANCE_ID = :instance_id
+            ORDER BY PATCH_NO DESC
+            FETCH FIRST 100 ROWS ONLY
+            """,
+            {'instance_id': instance_id},
+        )
+        patch_nos = [row[0] for row in cur.fetchall() if row[0] is not None]
+        return {'instance_id': instance_id, 'patch_nos': patch_nos}
+    except Exception as exc:
+        return {'error': f'Query failed: {exc}'}
+    finally:
+        conn.close()
+
+
+def fetch_group_tags_for_instance(instance_id):
+    conn, err = get_oracle_connection()
+    if err:
+        return {'error': err}
+
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT GROUP_ID
+            FROM VERSION_GROUP_MAP
+            WHERE INSTANCE_ID = :instance_id
+              AND GROUP_ID IS NOT NULL
+            ORDER BY GROUP_ID DESC
+            FETCH FIRST 100 ROWS ONLY
+            """,
+            {'instance_id': instance_id},
+        )
+        group_ids = [row[0] for row in cur.fetchall() if row[0] is not None]
+        return {'instance_id': instance_id, 'group_ids': group_ids}
+    except Exception as exc:
+        return {'error': f'Query failed: {exc}'}
+    finally:
+        conn.close()
+
+
+def fetch_patch_owner(instance_id, patch_no):
+    conn, err = get_oracle_connection()
+    if err:
+        return {'error': err}
+
+    try:
+        cur = conn.cursor()
+        patch_cols = _table_columns(cur, 'PATCH_DETAILS')
+        user_cols = _table_columns(cur, 'USER_PROFILE')
+
+        if not patch_cols:
+            return {'error': 'PATCH_DETAILS is not accessible in current schema.'}
+        if not user_cols:
+            return {'error': 'USER_PROFILE is not accessible in current schema.'}
+
+        build_candidates = [
+            col for col in patch_cols
+            if col in ('BUILD_BY', 'BUILT_BY', 'BUILD_USER', 'BUILD_USER_ID')
+        ]
+        if not build_candidates:
+            build_candidates = [col for col in patch_cols if 'BUILD' in col]
+        if not build_candidates:
+            return {'error': 'No BUILD BY style column found in PATCH_DETAILS.'}
+
+        build_col = build_candidates[0]
+
+        cur.execute(
+            f"""
+            SELECT {build_col}
+            FROM PATCH_DETAILS
+            WHERE INSTANCE_ID = :instance_id
+              AND TO_CHAR(PATCH_NO) = :patch_no
+            """,
+            {'instance_id': instance_id, 'patch_no': patch_no},
+        )
+        builder_ids = sorted({row[0] for row in cur.fetchall() if row[0] is not None})
+
+        if not builder_ids:
+            return {
+                'instance_id': instance_id,
+                'patch_no': patch_no,
+                'build_column': build_col,
+                'builder_ids': [],
+                'builder_names': {},
+            }
+
+        if 'USER_ID' not in user_cols or 'USER_NAME' not in user_cols:
+            return {
+                'instance_id': instance_id,
+                'patch_no': patch_no,
+                'build_column': build_col,
+                'builder_ids': builder_ids,
+                'builder_names': {},
+                'warning': 'USER_PROFILE is missing USER_ID or USER_NAME columns.',
+            }
+
+        bind_map = {}
+        in_clause = _build_in_clause('uid', builder_ids, bind_map)
+        cur.execute(
+            f"""
+            SELECT USER_ID, USER_NAME
+            FROM USER_PROFILE
+            WHERE USER_ID IN ({in_clause})
+            """,
+            bind_map,
+        )
+        builder_names = {row[0]: row[1] for row in cur.fetchall()}
+
+        return {
+            'instance_id': instance_id,
+            'patch_no': patch_no,
+            'build_column': build_col,
+            'builder_ids': builder_ids,
+            'builder_names': builder_names,
+        }
+    except Exception as exc:
+        return {'error': f'Query failed: {exc}'}
+    finally:
+        conn.close()
+
+
+def fetch_patch_details(instance_id, patch_no):
+    conn, err = get_oracle_connection()
+    if err:
+        return {'error': err}
+
+    try:
+        cur = conn.cursor()
+
+        # Keep file-list flow minimal to avoid timezone conversion issues in thin mode.
+        cur.execute(
+            """
+            SELECT PATCH_NO, GROUP_ID
+            FROM PATCH_DETAILS
+            WHERE TO_CHAR(PATCH_NO) = :patch_no
+              AND INSTANCE_ID = :instance_id
+            """,
+            {'patch_no': patch_no, 'instance_id': instance_id},
+        )
+        patch_rows = cur.fetchall()
+        group_ids = sorted({row[1] for row in patch_rows if row[1] is not None})
+
+        serial_nos = []
+        if group_ids:
+            bind_map = {'instance_id': instance_id}
+            in_clause = _build_in_clause('gid', group_ids, bind_map)
+            cur.execute(
+                f"""
+                SELECT SERIAL_NO
+                FROM VERSION_GROUP_MAP
+                WHERE INSTANCE_ID = :instance_id
+                  AND GROUP_ID IN ({in_clause})
+                """,
+                bind_map,
+            )
+            serial_nos = sorted({row[0] for row in cur.fetchall() if row[0] is not None})
+
+        filenames = []
+        if serial_nos:
+            bind_map = {'instance_id': instance_id}
+            in_clause = _build_in_clause('sid', serial_nos, bind_map)
+            cur.execute(
+                f"""
+                SELECT FILENAME
+                FROM VERSIONHISTORY
+                WHERE INSTANCE_ID = :instance_id
+                  AND SERIAL_NO IN ({in_clause})
+                ORDER BY FILENAME
+                """,
+                bind_map,
+            )
+            filenames = [row[0] for row in cur.fetchall() if row[0]]
+
+        return {
+            'instance_id': instance_id,
+            'patch_no': patch_no,
+            'group_ids': group_ids,
+            'serial_nos': serial_nos,
+            'filenames': filenames,
+            'unique_filenames': sorted(set(filenames)),
+        }
+    except Exception as exc:
+        return {'error': f'Query failed: {exc}'}
+    finally:
+        conn.close()
+
+
+def build_chat_response(message, active_instance=None, skip_instance_resolution=False):
+    text = (message or '').strip()
+    parsed_instance, patch_nos = parse_instance_and_patches(text)
+    instance_ref = parse_instance_reference(text)
+
+    if skip_instance_resolution:
+        resolved_instance = active_instance
+        pending = None
+    else:
+        provided_instance = parsed_instance or instance_ref
+        pending = None
+        resolved_instance = active_instance
+
+        if provided_instance:
+            search_result = fetch_instance_candidates(provided_instance)
+            if search_result.get('error'):
+                return search_result['error'], active_instance, None
+
+            candidates = search_result['candidates']
+            if not candidates:
+                return f'No instance found for "{provided_instance}".', active_instance, None
+
+            ids = [item['instance_id'] for item in candidates]
+            exact = [iid for iid in ids if iid.upper() == provided_instance.upper()]
+            unique_ids = []
+            seen = set()
+            for iid in ids:
+                key = iid.upper()
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique_ids.append(iid)
+
+            if exact:
+                resolved_instance = exact[0]
+            elif len(unique_ids) == 1:
+                resolved_instance = unique_ids[0]
+            else:
+                lines = [
+                    f'Multiple instance IDs found for "{provided_instance}". Please choose one:',
+                ]
+                for idx, iid in enumerate(unique_ids, start=1):
+                    lines.append(f'{idx}. {iid}')
+                lines.append('Reply with number or exact instance ID.')
+                pending = {
+                    'instances': unique_ids,
+                    'message': text,
+                }
+                return '\n'.join(lines), active_instance, pending
+
+    if resolved_instance and is_instance_only_message(text, resolved_instance):
+        prompt = [
+            f'Instance ID set to: {resolved_instance}',
+            'What do you want next?',
+            '- Patch no list',
+            '- File list from patch',
+            '- Group tags',
+            '- Who took patch',
+            '- Consolidation details',
+            '- QA server details',
+            '- Deployment details',
+        ]
+        return '\n'.join(prompt), resolved_instance, None
+
+    instance_id = resolved_instance
+    if not instance_id:
+        return 'Please provide an Instance ID first.', active_instance, None
+
+    need_consolidation = is_consolidation_request(text) or is_all_details_request(text)
+    need_qa = is_qa_server_request(text) or is_all_details_request(text)
+    need_deployment = is_deployment_request(text) or is_all_details_request(text)
+
+    if need_consolidation or need_qa or need_deployment:
+        lines = [f'Instance ID: {instance_id}']
+
+        if need_consolidation:
+            lines.append('')
+            lines.extend(_render_table_excerpt(
+                fetch_table_details('CLIENT_SERVER_INSTANCE_DTL', instance_id=instance_id),
+                'CLIENT_SERVER_INSTANCE_DTL',
+            ))
+
+        if need_qa:
+            lines.append('')
+            qa_result = fetch_client_server_map_details(instance_id=instance_id, qa_only=True)
+            if not qa_result.get('error') and qa_result.get('row_count', 0) == 0:
+                fallback_result = fetch_client_server_map_details(instance_id=instance_id, qa_only=False)
+                if not fallback_result.get('error') and fallback_result.get('row_count', 0) > 0:
+                    fallback_result.setdefault('warnings', []).append(
+                        'No rows matched QA keyword filter; showing all CLIENT_SERVER_MAP rows for this instance.'
+                    )
+                    qa_result = fallback_result
+            lines.extend(_render_client_server_map_details(
+                qa_result,
+                'CLIENT_SERVER_MAP (QA)',
+            ))
+
+        if need_deployment:
+            deployment_patches = patch_nos or [None]
+            for patch_no in deployment_patches:
+                lines.append('')
+                if patch_no is None:
+                    lines.append('Deployment details (instance level):')
+                else:
+                    lines.append(f'Deployment details for patch {patch_no}:')
+
+                lines.extend(_render_table_excerpt(
+                    fetch_table_details('PATCH_DEPLOYMENT_INFO', instance_id=instance_id, patch_no=patch_no),
+                    'PATCH_DEPLOYMENT_INFO',
+                ))
+                lines.extend(_render_table_excerpt(
+                    fetch_table_details('PATCH_INFO', instance_id=instance_id, patch_no=patch_no),
+                    'PATCH_INFO',
+                ))
+
+        return '\n'.join(lines).strip(), instance_id, None
+
+    if is_patch_owner_question(text):
+        if not patch_nos:
+            return f'Instance ID: {instance_id}\nPlease provide patch number(s) for owner lookup.', instance_id, None
+
+        lines = [f'Instance ID: {instance_id}']
+        for patch_no in patch_nos:
+            owner_result = fetch_patch_owner(instance_id, patch_no)
+            if owner_result.get('error'):
+                lines.append(f'Patch {patch_no}: {owner_result["error"]}')
+                lines.append('')
+                continue
+
+            lines.append(f'Patch No: {patch_no}')
+            lines.append(f'Build Column: {owner_result["build_column"]}')
+
+            if not owner_result['builder_ids']:
+                lines.append('Patch Taken By: not found in PATCH_DETAILS')
+                lines.append('')
+                continue
+
+            lines.append('Patch Taken By:')
+            for builder_id in owner_result['builder_ids']:
+                name = owner_result['builder_names'].get(builder_id)
+                if name:
+                    lines.append(f'- {builder_id} : {name}')
+                else:
+                    lines.append(f'- {builder_id} : name not found in USER_PROFILE')
+            lines.append('')
+
+        return '\n'.join(lines).strip(), instance_id, None
+
+    if is_patch_list_request(text) and not patch_nos:
+        patch_result = fetch_patch_numbers_for_instance(instance_id)
+        if patch_result.get('error'):
+            return patch_result['error'], instance_id, None
+        if not patch_result['patch_nos']:
+            return f'Instance ID: {instance_id}\nNo patch numbers found.', instance_id, None
+
+        lines = [f'Instance ID: {instance_id}', f'Patch Nos ({len(patch_result["patch_nos"])}):']
+        for patch_no in patch_result['patch_nos']:
+            lines.append(f'- {patch_no}')
+        return '\n'.join(lines), instance_id, None
+
+    if is_group_tags_request(text) and not patch_nos:
+        tag_result = fetch_group_tags_for_instance(instance_id)
+        if tag_result.get('error'):
+            return tag_result['error'], instance_id, None
+        if not tag_result['group_ids']:
+            return f'Instance ID: {instance_id}\nNo group tags found.', instance_id, None
+
+        lines = [f'Instance ID: {instance_id}', f'Group Tags ({len(tag_result["group_ids"])}):']
+        for gid in tag_result['group_ids']:
+            lines.append(f'- {gid}')
+        return '\n'.join(lines), instance_id, None
+
+    if not patch_nos:
+        return (
+            f'Instance ID: {instance_id}\nTell me what you need: patch no list, group tags, file list from patch <no>, consolidation details, QA server details, or deployment details.',
+            instance_id,
+            None,
+        )
+
+    lines = [f'Instance ID: {instance_id}']
+    for patch_no in patch_nos:
+        result = fetch_patch_details(instance_id, patch_no)
+        if result.get('error'):
+            lines.append(f'Patch {patch_no}: {result["error"]}')
+            lines.append('')
+            continue
+
+        if not result['group_ids']:
+            lines.append(f'Patch {patch_no}: No PATCH_DETAILS row found.')
+            lines.append('')
+            continue
+
+        lines.append(f'Patch No: {patch_no}')
+        lines.append(f'Group IDs: {", ".join(result["group_ids"])}')
+        lines.append(f'Serial Nos: {len(result["serial_nos"])}')
+        lines.append(f'Filenames ({len(result["filenames"])} rows, {len(result["unique_filenames"])} unique):')
+        if result['unique_filenames']:
+            for name in result['unique_filenames']:
+                lines.append(f'- {name}')
+        else:
+            lines.append('- No filenames found in VERSIONHISTORY')
+        lines.append('')
+
+    return '\n'.join(lines).strip(), instance_id, None
+
+
+def get_db():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with get_db() as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS links (
+                id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT    NOT NULL,
+                link TEXT    NOT NULL
+            )
+        ''')
+        conn.commit()
+
+
+@app.route('/', methods=['GET', 'POST'])
+def login():
+    if 'user' in session:
+        return redirect(url_for('dashboard'))
+
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '').strip()
+
+        if username == DEFAULT_USERNAME and password == DEFAULT_PASSWORD:
+            session['user'] = username
+            flash('Login successful!', 'success')
+            return redirect(url_for('dashboard'))
+        else:
+            flash('Invalid username or password.', 'danger')
+
+    return render_template('login.html')
+
+
+@app.route('/logout')
+def logout():
+    session.pop('user', None)
+    flash('You have been logged out.', 'info')
+    return redirect(url_for('login'))
+
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    with get_db() as conn:
+        records = conn.execute('SELECT id, name, link FROM links ORDER BY id DESC').fetchall()
+
+    return render_template('dashboard.html', records=records)
+
+
+@app.route('/add', methods=['GET', 'POST'])
+@login_required
+def add_record():
+    if request.method == 'POST':
+        name = request.form.get('name', '').strip()
+        link = request.form.get('link', '').strip()
+
+        if not name or not link:
+            flash('Both Name and Link are required.', 'danger')
+            return render_template('add_record.html')
+
+        with get_db() as conn:
+            conn.execute('INSERT INTO links (name, link) VALUES (?, ?)', (name, link))
+            conn.commit()
+
+        flash(f'Record "{name}" added successfully!', 'success')
+        return redirect(url_for('dashboard'))
+
+    return render_template('add_record.html')
+
+
+@app.route('/edit/<int:record_id>', methods=['GET', 'POST'])
+@login_required
+def edit_record(record_id):
+    with get_db() as conn:
+        row = conn.execute('SELECT id, name, link FROM links WHERE id = ?', (record_id,)).fetchone()
+        if not row:
+            flash('Record not found.', 'danger')
+            return redirect(url_for('dashboard'))
+
+        if request.method == 'POST':
+            name = request.form.get('name', '').strip()
+            link = request.form.get('link', '').strip()
+            if not name or not link:
+                flash('Both Name and Link are required.', 'danger')
+                return render_template('edit_record.html', record=row)
+            conn.execute('UPDATE links SET name = ?, link = ? WHERE id = ?', (name, link, record_id))
+            conn.commit()
+            flash(f'Record "{name}" updated successfully!', 'success')
+            return redirect(url_for('dashboard'))
+
+    return render_template('edit_record.html', record=row)
+
+
+@app.route('/run/<int:record_id>')
+@login_required
+def run_record(record_id):
+    """Execute a local file path stored as the link for this record."""
+    with get_db() as conn:
+        row = conn.execute('SELECT name, link FROM links WHERE id = ?', (record_id,)).fetchone()
+
+    if not row:
+        flash('Record not found.', 'danger')
+        return redirect(url_for('dashboard'))
+
+    path = row['link']
+    # Only allow absolute Windows paths to prevent arbitrary command injection
+    if not re.match(r'^[A-Za-z]:\\', path):
+        flash('This link is not a local file path.', 'danger')
+        return redirect(url_for('dashboard'))
+
+    if not os.path.isfile(path):
+        flash(f'File not found: {path}', 'danger')
+        return redirect(url_for('dashboard'))
+
+    # Use cmd /c start so Windows picks the right handler (e.g. wscript for .vbs)
+    subprocess.Popen(['cmd', '/c', 'start', '', path], shell=False)
+    flash(f'"{row["name"]}" launched successfully.', 'success')
+    return redirect(url_for('dashboard'))
+
+
+@app.route('/delete/<int:record_id>', methods=['POST'])
+@login_required
+def delete_record(record_id):
+    with get_db() as conn:
+        row = conn.execute('SELECT name FROM links WHERE id = ?', (record_id,)).fetchone()
+        if row:
+            conn.execute('DELETE FROM links WHERE id = ?', (record_id,))
+            conn.commit()
+            flash(f'Record "{row["name"]}" deleted successfully!', 'success')
+        else:
+            flash('Record not found.', 'danger')
+
+    return redirect(url_for('dashboard'))
+
+
+def process_chat_message(message):
+    history = session.get('chat_history', [])
+    active_instance = session.get('chat_instance_id')
+    pending_instances = session.get('chat_pending_instances')
+    pending_message = session.get('chat_pending_message')
+
+    bot_text = ''
+    if message:
+        history.append({'role': 'user', 'text': message})
+
+        if pending_instances:
+            selected = resolve_instance_choice(message, pending_instances)
+            if selected:
+                active_instance = selected
+                session.pop('chat_pending_instances', None)
+                session.pop('chat_pending_message', None)
+
+                if pending_message:
+                    follow_text, active_instance, pending = build_chat_response(
+                        pending_message,
+                        active_instance,
+                        skip_instance_resolution=True,
+                    )
+                    bot_text = f'Instance selected: {active_instance}\n{follow_text}'
+                    if pending:
+                        session['chat_pending_instances'] = pending['instances']
+                        session['chat_pending_message'] = pending['message']
+                else:
+                    bot_text = (
+                        f'Instance ID set to: {active_instance}\n'
+                        'What do you want next?\n'
+                        '- Patch no list\n'
+                        '- File list from patch\n'
+                        '- Group tags\n'
+                        '- Who took patch'
+                    )
+            else:
+                lines = ['Please choose a valid instance by number or exact ID:']
+                for idx, iid in enumerate(pending_instances, start=1):
+                    lines.append(f'{idx}. {iid}')
+                bot_text = '\n'.join(lines)
+        else:
+            bot_text, active_instance, pending = build_chat_response(message, active_instance)
+            if pending:
+                session['chat_pending_instances'] = pending['instances']
+                session['chat_pending_message'] = pending['message']
+
+        history.append({'role': 'assistant', 'text': bot_text})
+        history = history[-20:]
+        session['chat_history'] = history
+        if active_instance:
+            session['chat_instance_id'] = active_instance
+        else:
+            session.pop('chat_instance_id', None)
+
+    return bot_text, history
+
+
+@app.route('/chatbot', methods=['GET', 'POST'])
+@login_required
+def chatbot():
+    history = session.get('chat_history', [])
+
+    if request.method == 'POST':
+        message = request.form.get('message', '').strip()
+        if message:
+            process_chat_message(message)
+            history = session.get('chat_history', history)
+
+    return render_template('chatbot.html', history=history)
+
+
+@app.route('/chatbot/message', methods=['POST'])
+@login_required
+def chatbot_message():
+    data = request.get_json(silent=True) or {}
+    message = str(data.get('message', '')).strip()
+    if not message:
+        return jsonify({'ok': False, 'error': 'Message is required.'}), 400
+
+    reply, _ = process_chat_message(message)
+    return jsonify({'ok': True, 'reply': reply})
+
+
+@app.route('/chatbot/clear', methods=['POST'])
+@login_required
+def clear_chatbot():
+    session.pop('chat_history', None)
+    session.pop('chat_instance_id', None)
+    session.pop('chat_pending_instances', None)
+    session.pop('chat_pending_message', None)
+    flash('Chat history cleared.', 'info')
+    return redirect(url_for('chatbot'))
+
+
+if __name__ == '__main__':
+    init_db()
+    app.run(host='0.0.0.0', port=5000, debug=True)

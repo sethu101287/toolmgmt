@@ -1,0 +1,770 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nexus Repository – Tool Manager</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet" />
+  <style>
+    body { background: #f0f2f5; }
+    a { text-decoration: none; color: #464feb; }
+    tr th, tr td { border: 1px solid #e6e6e6; }
+    tr th { background-color: #f5f5f5; }
+    .navbar { background: linear-gradient(135deg, #0f3460, #533483) !important; }
+    .logo-badge { background: #fff; padding: 4px 8px; border-radius: 6px; display: inline-flex; align-items: center; }
+    .card { border: none; border-radius: 12px; box-shadow: 0 2px 16px rgba(0,0,0,.08); }
+    .table thead { background: linear-gradient(135deg, #0f3460, #533483); color: #fff; }
+    .conn-status { font-weight: 600; }
+    .conn-status.success { color: #198754; }
+    .conn-status.error { color: #dc3545; }
+    .conn-status.unknown { color: #6c757d; }
+    .artifact-row { cursor: pointer; }
+    .artifact-row.selected-row { background: #a3d9a5 !important; }
+    #downloadLog { max-height: 180px; overflow-y: auto; font-size: .85rem; background: #212529; color: #d1e7dd; border-radius: 8px; padding: 10px; }
+    #downloadLog .log-error { color: #f1aeb5; }
+    #progressWrap { display: none; }
+    .list-group-item-action.active { background: linear-gradient(135deg, #0f3460, #533483); border-color: transparent; }
+  </style>
+</head>
+<body>
+  <nav class="navbar navbar-dark px-4 py-3">
+    <div class="d-flex align-items-center gap-3">
+      <button class="btn btn-outline-light btn-sm" type="button" data-bs-toggle="offcanvas" data-bs-target="#appMenu" aria-controls="appMenu">
+        <i class="bi bi-list fs-5"></i>
+      </button>
+      <span class="navbar-brand d-flex align-items-center mb-0">
+        <span class="logo-badge"><img src="{{ url_for('static', filename='img/logo.png') }}" alt="Logo" height="28"></span>
+      </span>
+    </div>
+    <div class="d-flex align-items-center gap-3">
+      <a href="{{ url_for('logout') }}" class="btn btn-outline-light btn-sm">
+        <i class="bi bi-box-arrow-right"></i> Logout
+      </a>
+    </div>
+  </nav>
+
+  <div class="offcanvas offcanvas-start" tabindex="-1" id="appMenu" aria-labelledby="appMenuLabel">
+    <div class="offcanvas-header">
+      <h5 class="offcanvas-title" id="appMenuLabel">Menu</h5>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body p-0">
+      <div class="list-group list-group-flush">
+        <a href="{{ url_for('dashboard') }}" class="list-group-item list-group-item-action {{ 'active' if active_page == 'dashboard' }}">
+          <i class="bi bi-speedometer2 me-2"></i>Dashboard
+        </a>
+        {% if session.get('is_admin') %}
+        <a href="{{ url_for('manage_users') }}" class="list-group-item list-group-item-action {{ 'active' if active_page == 'manage_users' }}">
+          <i class="bi bi-people-fill me-2"></i>Manage Users
+        </a>
+        {% endif %}
+        {% if session.get('is_admin') or 'nexus_repo' in session.get('tabs', []) %}
+        <a href="{{ url_for('nexus_repository') }}" class="list-group-item list-group-item-action {{ 'active' if active_page == 'nexus_repository' }}">
+          <i class="bi bi-box-seam me-2"></i>Nexus Repository
+        </a>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="container py-4">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}
+        <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+          {{ message }}
+          <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+      {% endfor %}
+    {% endwith %}
+
+    <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+      <h4 class="mb-0"><i class="bi bi-box-seam me-2 text-primary"></i>Nexus Repository</h4>
+      <div class="d-flex align-items-center gap-2">
+        <button type="button" class="btn btn-outline-primary" id="btnOpenConnections" data-bs-toggle="offcanvas" data-bs-target="#connectionsPanel">
+          <i class="bi bi-arrow-repeat me-1"></i>Test Connection
+        </button>
+        <button type="button" class="btn btn-outline-primary position-relative" id="btnNotifications" data-bs-toggle="offcanvas" data-bs-target="#notificationsPanel">
+          <i class="bi bi-bell-fill me-1"></i>Notifications
+          <span class="badge rounded-pill bg-danger" id="notificationBadge" style="display:none;">0</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Search / Filter Panel -->
+    <div class="card mb-3">
+      <div class="card-body">
+        <div class="fw-semibold mb-2"><i class="bi bi-search me-1"></i>Search Maven Components</div>
+        <div class="row g-2">
+          <div class="col-md-3">
+            <label class="form-label small mb-1">Repository</label>
+            <input type="text" class="form-control form-control-sm" id="repositoryInput" value="{{ default_repository }}">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label small mb-1">Group ID</label>
+            <input type="text" class="form-control form-control-sm" id="groupInput" placeholder="com.example">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label small mb-1">Artifact ID</label>
+            <input type="text" class="form-control form-control-sm" id="artifactInput" placeholder="my-app">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label small mb-1">Version</label>
+            <input type="text" class="form-control form-control-sm" id="versionInput" placeholder="1.0.0">
+          </div>
+          <div class="col-md-9">
+            <label class="form-label small mb-1">Keyword</label>
+            <input type="text" class="form-control form-control-sm" id="keywordInput" placeholder="Search by name/path...">
+          </div>
+          <div class="col-md-3 d-flex align-items-end">
+            <button type="button" class="btn btn-primary btn-sm w-100" id="btnSearch">
+              <i class="bi bi-search me-1"></i>Search
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Artifact List Grid -->
+    <div class="card mb-3">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <div class="fw-semibold">
+            Artifacts <span class="badge bg-secondary ms-1" id="resultCount">0</span>
+          </div>
+          <div class="d-flex gap-2">
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="btnSelectAll">Select All</button>
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="btnClearSelection">Clear</button>
+            <button type="button" class="btn btn-sm btn-success" id="btnDownload" disabled>
+              <i class="bi bi-download me-1"></i>Download Selected (<span id="selectedCount">0</span>)
+            </button>
+          </div>
+        </div>
+        <div class="table-responsive" style="max-height: 50vh; overflow-y: auto;">
+          <table class="table table-hover table-sm mb-0">
+            <thead>
+              <tr>
+                <th style="width: 30px;"></th>
+                <th>Group ID</th>
+                <th>Artifact ID</th>
+                <th>Version</th>
+                <th>Repository</th>
+                <th>File</th>
+                <th>Size</th>
+              </tr>
+            </thead>
+            <tbody id="artifactTableBody">
+              <tr><td colspan="7" class="text-center text-muted py-3">Search to load artifacts.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Download Status / Logs Panel -->
+    <div class="card">
+      <div class="card-body">
+        <div class="fw-semibold mb-2"><i class="bi bi-terminal me-1"></i>Download Status</div>
+        <div id="progressWrap" class="mb-2">
+          <div class="progress" style="height: 18px;">
+            <div class="progress-bar" id="downloadProgressBar" style="width: 0%;">0%</div>
+          </div>
+        </div>
+        <div id="downloadLog">Ready.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Connections Panel: test Nexus and 192.1.2.93 independently, one row per source -->
+  <div class="offcanvas offcanvas-end" tabindex="-1" id="connectionsPanel" aria-labelledby="connectionsPanelLabel" style="width: 420px;">
+    <div class="offcanvas-header">
+      <h5 class="offcanvas-title" id="connectionsPanelLabel"><i class="bi bi-arrow-repeat me-1"></i>Test Connection</h5>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body">
+
+      <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap">
+        <div>
+          <div class="fw-semibold">Nexus Repository</div>
+          <div class="text-muted small">{{ nexus_base_url }}</div>
+        </div>
+        <div class="d-flex align-items-center gap-2">
+          <button type="button" class="btn btn-sm btn-outline-primary" id="btnTestConnection">
+            <i class="bi bi-arrow-repeat me-1"></i>Test Connection
+          </button>
+          <span class="conn-status unknown" id="statusBadge">Not tested yet.</span>
+        </div>
+      </div>
+      <div class="text-muted small mt-1">
+        Credentials are read from <code>NEXUS_USERNAME</code> / <code>NEXUS_PASSWORD</code> environment
+        variables on the server (never entered in the browser).
+      </div>
+
+      <hr>
+
+      <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap">
+        <div>
+          <div class="fw-semibold">192.1.2.93 Server (SFTP)</div>
+          <div class="text-muted small" id="remoteServerLabel">192.1.2.93</div>
+        </div>
+        <div class="d-flex align-items-center gap-2">
+          <button type="button" class="btn btn-sm btn-outline-primary" id="btnTestRemoteConnection">
+            <i class="bi bi-arrow-repeat me-1"></i>Test Connection
+          </button>
+          <span class="conn-status unknown" id="remoteStatusBadge">Not tested yet.</span>
+        </div>
+      </div>
+      <div class="text-muted small mt-1">
+        Credentials are read from <code>REMOTE_SSH_USER</code> / <code>REMOTE_SSH_PASSWORD</code>
+        (or <code>REMOTE_SSH_KEY_PATH</code>) environment variables on the server.
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Notifications Panel: new artifacts detected under the monitored group (com.softeon) -->
+  <div class="offcanvas offcanvas-end" tabindex="-1" id="notificationsPanel" aria-labelledby="notificationsPanelLabel" style="width: 420px;">
+    <div class="offcanvas-header">
+      <h5 class="offcanvas-title" id="notificationsPanelLabel"><i class="bi bi-bell-fill me-1"></i>Artifact Notifications</h5>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body">
+      <div class="d-flex flex-wrap gap-2 mb-3">
+        <select class="form-select form-select-sm" id="notifStatusFilter" style="width: auto;">
+          <option value="">All statuses</option>
+          <option value="new">New</option>
+          <option value="viewed">Viewed</option>
+          <option value="downloaded">Downloaded</option>
+        </select>
+        <input type="text" class="form-control form-control-sm" id="notifSearchInput" placeholder="Filter by name/version..." style="width: 160px;">
+        <button type="button" class="btn btn-sm btn-outline-secondary" id="btnNotifRefresh">
+          <i class="bi bi-arrow-repeat"></i>
+        </button>
+        <button type="button" class="btn btn-sm btn-outline-primary" id="btnPollNow" title="Check Nexus right now">
+          <i class="bi bi-cloud-arrow-down me-1"></i>Poll Now
+        </button>
+      </div>
+      <div id="notificationsList">Loading...</div>
+    </div>
+  </div>
+
+  <!-- Download Location Modal -->
+  <div class="modal fade" id="downloadLocationModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Choose Download Location</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body d-grid gap-2">
+          <button type="button" class="btn btn-outline-primary text-start py-3" id="btnDownloadLocal">
+            <i class="bi bi-laptop me-2"></i><strong>Local Machine</strong>
+            <div class="small text-muted">Save the selected component(s) to this computer.</div>
+          </button>
+          <button type="button" class="btn btn-outline-primary text-start py-3" id="btnDownloadRemote">
+            <i class="bi bi-hdd-network me-2"></i><strong>Remote Server (192.1.2.93)</strong>
+            <div class="small text-muted">Transfer via SFTP to /u02/VC/Tools on the remote server.</div>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="notifToastContainer" class="toast-container position-fixed bottom-0 end-0 p-3" style="z-index: 1080;"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+    let currentItems = [];
+    const selectedKeys = new Set();
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text == null ? '' : String(text);
+      return div.innerHTML;
+    }
+
+    function logLine(message, isError) {
+      const log = document.getElementById('downloadLog');
+      const line = document.createElement('div');
+      if (isError) line.className = 'log-error';
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+      log.appendChild(line);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function formatSize(bytes) {
+      if (bytes == null) return '-';
+      if (bytes < 1024) return `${bytes} B`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+      return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    }
+
+    async function apiFetch(url, options) {
+      const resp = await fetch(url, options);
+      let data = {};
+      try { data = await resp.json(); } catch (e) { data = {}; }
+      if (!resp.ok) {
+        throw new Error(data.error || 'Request failed.');
+      }
+      return data;
+    }
+
+    async function testConnection() {
+      const status = document.getElementById('statusBadge');
+      status.className = 'conn-status unknown';
+      status.textContent = 'Checking...';
+      try {
+        const data = await apiFetch('/api/nexus/status');
+        if (data.connected) {
+          status.className = 'conn-status success';
+          status.textContent = `✅ Nexus Connection Successful${data.authenticated ? ' (authenticated)' : ' (anonymous)'}`;
+        } else {
+          status.className = 'conn-status error';
+          status.textContent = '❌ Nexus Connection Failed';
+          logLine(data.error || 'Unable to connect to Nexus.', true);
+        }
+      } catch (e) {
+        status.className = 'conn-status error';
+        status.textContent = '❌ Nexus Connection Failed';
+        logLine(e.message, true);
+      }
+    }
+
+    async function testRemoteConnection() {
+      const status = document.getElementById('remoteStatusBadge');
+      status.className = 'conn-status unknown';
+      status.textContent = 'Checking...';
+      try {
+        const data = await apiFetch('/api/nexus/remote-status');
+        document.getElementById('remoteServerLabel').textContent = `${data.host}:${data.port} → ${data.path}`;
+        if (data.reachable && data.authenticated) {
+          status.className = 'conn-status success';
+          status.textContent = '✅ Server Connection Successful';
+        } else if (data.reachable && !data.configured) {
+          status.className = 'conn-status error';
+          status.textContent = '❌ Server Connection Failed (reachable, but no credentials configured)';
+          logLine(data.error || 'Remote server reachable but credentials are not configured.', true);
+        } else if (data.reachable) {
+          status.className = 'conn-status error';
+          status.textContent = '❌ Server Connection Failed (authentication failed)';
+          logLine(data.error || 'Could not authenticate to the remote server.', true);
+        } else {
+          status.className = 'conn-status error';
+          status.textContent = '❌ Server Connection Failed (not reachable)';
+          logLine(data.error || `Cannot reach ${data.host}:${data.port}.`, true);
+        }
+      } catch (e) {
+        status.className = 'conn-status error';
+        status.textContent = '❌ Server Connection Failed';
+        logLine(e.message, true);
+      }
+    }
+
+    function assetKey(a) {
+      return `${a.group}:${a.artifact}:${a.version}:${a.path}`;
+    }
+
+    function renderArtifacts(items) {
+      currentItems = items;
+      const body = document.getElementById('artifactTableBody');
+      document.getElementById('resultCount').textContent = items.length;
+      if (!items.length) {
+        body.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-3">No artifacts found.</td></tr>';
+        updateSelectedCount();
+        return;
+      }
+      body.innerHTML = items.map((a) => {
+        const key = assetKey(a);
+        const checked = selectedKeys.has(key);
+        return `
+          <tr class="artifact-row ${checked ? 'selected-row' : ''}" data-key="${escapeHtml(key)}">
+            <td><input type="checkbox" class="form-check-input artifact-checkbox" ${checked ? 'checked' : ''}></td>
+            <td>${escapeHtml(a.group)}</td>
+            <td>${escapeHtml(a.artifact)}</td>
+            <td>${escapeHtml(a.version)}</td>
+            <td>${escapeHtml(a.repository)}</td>
+            <td>${escapeHtml(a.path)}</td>
+            <td>${formatSize(a.size)}</td>
+          </tr>
+        `;
+      }).join('');
+
+      body.querySelectorAll('tr[data-key]').forEach((row) => {
+        const key = row.dataset.key;
+        const checkbox = row.querySelector('.artifact-checkbox');
+        const toggle = () => {
+          if (selectedKeys.has(key)) {
+            selectedKeys.delete(key);
+          } else {
+            selectedKeys.add(key);
+          }
+          row.classList.toggle('selected-row', selectedKeys.has(key));
+          checkbox.checked = selectedKeys.has(key);
+          updateSelectedCount();
+        };
+        row.addEventListener('click', (e) => {
+          if (e.target === checkbox) return;
+          toggle();
+        });
+        checkbox.addEventListener('click', (e) => {
+          e.stopPropagation();
+          toggle();
+        });
+      });
+    }
+
+    function updateSelectedCount() {
+      document.getElementById('selectedCount').textContent = selectedKeys.size;
+      document.getElementById('btnDownload').disabled = selectedKeys.size === 0;
+    }
+
+    async function runSearch() {
+      const params = new URLSearchParams({
+        repository: document.getElementById('repositoryInput').value.trim(),
+        group: document.getElementById('groupInput').value.trim(),
+        artifact: document.getElementById('artifactInput').value.trim(),
+        version: document.getElementById('versionInput').value.trim(),
+        q: document.getElementById('keywordInput').value.trim(),
+      });
+      document.getElementById('artifactTableBody').innerHTML = '<tr><td colspan="7" class="text-center text-muted py-3">Searching...</td></tr>';
+      try {
+        const data = await apiFetch('/api/nexus/search?' + params.toString());
+        renderArtifacts(data.items || []);
+        logLine(`Found ${(data.items || []).length} component(s).`);
+      } catch (e) {
+        document.getElementById('artifactTableBody').innerHTML = '<tr><td colspan="7" class="text-center text-danger py-3">Search failed.</td></tr>';
+        logLine(e.message, true);
+      }
+    }
+
+    document.getElementById('btnTestConnection').addEventListener('click', testConnection);
+    document.getElementById('btnTestRemoteConnection').addEventListener('click', testRemoteConnection);
+    document.getElementById('btnSearch').addEventListener('click', runSearch);
+    [document.getElementById('groupInput'), document.getElementById('artifactInput'), document.getElementById('versionInput'), document.getElementById('keywordInput')].forEach((el) => {
+      el.addEventListener('keydown', (e) => { if (e.key === 'Enter') runSearch(); });
+    });
+
+    document.getElementById('btnSelectAll').addEventListener('click', () => {
+      currentItems.forEach((a) => selectedKeys.add(assetKey(a)));
+      renderArtifacts(currentItems);
+      updateSelectedCount();
+    });
+    document.getElementById('btnClearSelection').addEventListener('click', () => {
+      selectedKeys.clear();
+      renderArtifacts(currentItems);
+      updateSelectedCount();
+    });
+
+    document.getElementById('btnDownload').addEventListener('click', () => {
+      if (!selectedKeys.size) return;
+      new bootstrap.Modal(document.getElementById('downloadLocationModal')).show();
+    });
+
+    function hideLocationModal() {
+      const modalEl = document.getElementById('downloadLocationModal');
+      const instance = bootstrap.Modal.getInstance(modalEl);
+      if (instance) instance.hide();
+    }
+
+    document.getElementById('btnDownloadLocal').addEventListener('click', () => {
+      hideLocationModal();
+      downloadLocal();
+    });
+
+    document.getElementById('btnDownloadRemote').addEventListener('click', () => {
+      hideLocationModal();
+      downloadRemote();
+    });
+
+    async function downloadLocal() {
+      const assets = currentItems.filter((a) => selectedKeys.has(assetKey(a)));
+      if (!assets.length) return;
+
+      const btn = document.getElementById('btnDownload');
+      const progressWrap = document.getElementById('progressWrap');
+      const progressBar = document.getElementById('downloadProgressBar');
+      progressBar.classList.remove('progress-bar-striped', 'progress-bar-animated');
+      btn.disabled = true;
+      progressWrap.style.display = 'block';
+      progressBar.style.width = '10%';
+      progressBar.textContent = 'Requesting...';
+      logLine(`Downloading ${assets.length} component(s) to local machine...`);
+
+      try {
+        const resp = await fetch('/api/nexus/download', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ assets: assets.map((a) => ({ download_url: a.download_url, path: a.path })) }),
+        });
+
+        if (!resp.ok) {
+          let errMsg = 'Download failed.';
+          try { errMsg = (await resp.json()).error || errMsg; } catch (e) { /* ignore */ }
+          throw new Error(errMsg);
+        }
+
+        const total = Number(resp.headers.get('Content-Length')) || 0;
+        const reader = resp.body.getReader();
+        const chunks = [];
+        let received = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          received += value.length;
+          if (total) {
+            const pct = Math.min(100, Math.round((received / total) * 100));
+            progressBar.style.width = pct + '%';
+            progressBar.textContent = pct + '%';
+          }
+        }
+
+        const disposition = resp.headers.get('Content-Disposition') || '';
+        const match = disposition.match(/filename="?([^"]+)"?/);
+        const filename = match ? match[1] : 'nexus-download';
+        const blob = new Blob(chunks);
+        const objectUrl = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = objectUrl;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(objectUrl);
+
+        progressBar.style.width = '100%';
+        progressBar.textContent = '100%';
+        logLine(`Downloaded ${filename} to local machine.`);
+      } catch (e) {
+        logLine(e.message, true);
+      } finally {
+        btn.disabled = selectedKeys.size === 0;
+        setTimeout(() => { progressWrap.style.display = 'none'; }, 1500);
+      }
+    }
+
+    async function downloadRemote() {
+      const assets = currentItems.filter((a) => selectedKeys.has(assetKey(a)));
+      if (!assets.length) return;
+
+      const btn = document.getElementById('btnDownload');
+      const progressWrap = document.getElementById('progressWrap');
+      const progressBar = document.getElementById('downloadProgressBar');
+      btn.disabled = true;
+      progressWrap.style.display = 'block';
+      progressBar.classList.add('progress-bar-striped', 'progress-bar-animated');
+      progressBar.style.width = '100%';
+      progressBar.textContent = 'Transferring to 192.1.2.93...';
+      logLine(`Transferring ${assets.length} component(s) to 192.1.2.93:/u02/VC/Tools via SFTP...`);
+
+      try {
+        const resp = await fetch('/api/nexus/download-remote', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ assets: assets.map((a) => ({ download_url: a.download_url, path: a.path })) }),
+        });
+
+        let data = {};
+        try { data = await resp.json(); } catch (e) { data = {}; }
+
+        if (!resp.ok && !data.results) {
+          throw new Error(data.error || `Remote transfer failed (HTTP ${resp.status}).`);
+        }
+
+        (data.results || []).forEach((r) => {
+          if (r.success) {
+            logLine(`Transferred ${r.filename} to ${data.host}:${data.path}.`);
+          } else {
+            logLine(`Failed to transfer ${r.filename}: ${r.error}`, true);
+          }
+        });
+
+        if (data.success) {
+          logLine('Remote transfer completed successfully.');
+        } else {
+          logLine('Remote transfer completed with errors.', true);
+        }
+      } catch (e) {
+        logLine(e.message, true);
+      } finally {
+        progressBar.classList.remove('progress-bar-striped', 'progress-bar-animated');
+        btn.disabled = selectedKeys.size === 0;
+        setTimeout(() => { progressWrap.style.display = 'none'; }, 1500);
+      }
+    }
+
+    // ---- Notifications (new artifacts detected under the monitored group) ----
+    let lastKnownUnread = 0;
+
+    function statusBadgeHtml(status) {
+      const map = { new: 'bg-danger', viewed: 'bg-secondary', downloaded: 'bg-success' };
+      const cls = map[status] || 'bg-secondary';
+      return `<span class="badge ${cls}">${escapeHtml(status)}</span>`;
+    }
+
+    function renderNotifications(items) {
+      const list = document.getElementById('notificationsList');
+      if (!items.length) {
+        list.innerHTML = '<div class="text-muted text-center py-4">No artifact notifications found.</div>';
+        return;
+      }
+      list.innerHTML = items.map((n) => `
+        <div class="card mb-2" data-id="${n.id}">
+          <div class="card-body p-2">
+            <div class="d-flex justify-content-between align-items-start">
+              <div class="fw-semibold">${escapeHtml(n.artifact_id)}</div>
+              ${statusBadgeHtml(n.status)}
+            </div>
+            <div class="small text-muted">Version: ${escapeHtml(n.version)}</div>
+            <div class="small text-muted">Published: ${escapeHtml(n.detected_at)}</div>
+            <div class="small text-muted mb-2">Path: ${escapeHtml(n.path)}</div>
+            <div class="d-flex flex-wrap gap-1">
+              <a href="${n.nexus_ui_url}" target="_blank" rel="noopener" class="btn btn-sm btn-outline-primary">
+                <i class="bi bi-box-arrow-up-right me-1"></i>Open in Nexus
+              </a>
+              <button type="button" class="btn btn-sm btn-outline-success btn-notif-download">
+                <i class="bi bi-download me-1"></i>Download
+              </button>
+              <button type="button" class="btn btn-sm btn-outline-secondary btn-notif-remote">
+                <i class="bi bi-hdd-network me-1"></i>Send to 192.1.2.93
+              </button>
+              <button type="button" class="btn btn-sm btn-outline-secondary btn-notif-copy">
+                <i class="bi bi-clipboard me-1"></i>Copy URL
+              </button>
+            </div>
+          </div>
+        </div>
+      `).join('');
+
+      list.querySelectorAll('.card[data-id]').forEach((card) => {
+        const id = card.dataset.id;
+        const item = items.find((n) => String(n.id) === id);
+
+        card.querySelector('.btn-notif-download').addEventListener('click', async () => {
+          try {
+            const resp = await fetch('/api/nexus/download', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ assets: [{ download_url: item.download_url, path: item.path }] }),
+            });
+            if (!resp.ok) throw new Error('Download failed.');
+            const blob = await resp.blob();
+            const objectUrl = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = objectUrl;
+            link.download = (item.path || 'component').split('/').pop();
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            URL.revokeObjectURL(objectUrl);
+            await apiFetch(`/api/nexus/notifications/${id}/downloaded`, { method: 'POST' });
+            logLine(`Downloaded ${item.artifact_id} ${item.version} from notifications.`);
+            loadNotifications();
+          } catch (e) {
+            logLine(e.message, true);
+          }
+        });
+
+        card.querySelector('.btn-notif-remote').addEventListener('click', async () => {
+          try {
+            const data = await apiFetch('/api/nexus/download-remote', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ assets: [{ download_url: item.download_url, path: item.path }] }),
+            });
+            (data.results || []).forEach((r) => {
+              logLine(r.success ? `Transferred ${r.filename} to ${data.host}:${data.path}.` : `Failed to transfer ${r.filename}: ${r.error}`, !r.success);
+            });
+            await apiFetch(`/api/nexus/notifications/${id}/downloaded`, { method: 'POST' });
+            loadNotifications();
+          } catch (e) {
+            logLine(e.message, true);
+          }
+        });
+
+        card.querySelector('.btn-notif-copy').addEventListener('click', async () => {
+          try {
+            await navigator.clipboard.writeText(item.download_url || '');
+            logLine('Download URL copied to clipboard.');
+          } catch (e) {
+            logLine('Could not copy URL to clipboard.', true);
+          }
+        });
+      });
+    }
+
+    async function loadNotifications() {
+      const params = new URLSearchParams();
+      const status = document.getElementById('notifStatusFilter').value;
+      const q = document.getElementById('notifSearchInput').value.trim();
+      if (status) params.set('status', status);
+      if (q) params.set('q', q);
+      try {
+        const data = await apiFetch('/api/nexus/notifications?' + params.toString());
+        renderNotifications(data.notifications || []);
+        const newOnes = (data.notifications || []).filter((n) => n.status === 'new');
+        if (newOnes.length) {
+          await Promise.all(newOnes.map((n) => apiFetch(`/api/nexus/notifications/${n.id}/view`, { method: 'POST' }).catch(() => {})));
+          refreshUnreadBadge();
+        }
+      } catch (e) {
+        document.getElementById('notificationsList').innerHTML = `<div class="text-danger">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    async function refreshUnreadBadge() {
+      try {
+        const data = await apiFetch('/api/nexus/notifications/unread-count');
+        const badge = document.getElementById('notificationBadge');
+        if (data.count > 0) {
+          badge.style.display = 'inline-block';
+          badge.textContent = data.count;
+        } else {
+          badge.style.display = 'none';
+        }
+        if (data.count > lastKnownUnread) {
+          showNotifToast(`${data.count - lastKnownUnread} new artifact(s) detected under com.softeon.`);
+        }
+        lastKnownUnread = data.count;
+      } catch (e) { /* silent - badge just won't update this cycle */ }
+    }
+
+    function showNotifToast(message) {
+      const container = document.getElementById('notifToastContainer');
+      const toastEl = document.createElement('div');
+      toastEl.className = 'toast align-items-center text-bg-primary border-0';
+      toastEl.setAttribute('role', 'alert');
+      toastEl.innerHTML = `
+        <div class="d-flex">
+          <div class="toast-body"><i class="bi bi-bell-fill me-1"></i>${escapeHtml(message)}</div>
+          <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
+        </div>`;
+      container.appendChild(toastEl);
+      const toast = new bootstrap.Toast(toastEl, { delay: 15000 });
+      toast.show();
+      toastEl.addEventListener('hidden.bs.toast', () => toastEl.remove());
+    }
+
+    document.getElementById('notifStatusFilter').addEventListener('change', loadNotifications);
+    document.getElementById('notifSearchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') loadNotifications(); });
+    document.getElementById('btnNotifRefresh').addEventListener('click', loadNotifications);
+    document.getElementById('btnPollNow').addEventListener('click', async () => {
+      try {
+        const data = await apiFetch('/api/nexus/notifications/poll-now', { method: 'POST' });
+        logLine(`Poll complete: ${data.new_count} new artifact(s) found.`);
+        loadNotifications();
+        refreshUnreadBadge();
+      } catch (e) {
+        logLine(e.message, true);
+      }
+    });
+    document.getElementById('notificationsPanel').addEventListener('shown.bs.offcanvas', loadNotifications);
+
+    refreshUnreadBadge();
+    setInterval(refreshUnreadBadge, 60000);
+
+    testConnection();
+    testRemoteConnection();
+  </script>
+</body>
+</html>

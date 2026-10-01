@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Patch Chatbot - Tool Manager</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: radial-gradient(circle at 0% 0%, #dff1ff 0%, #f3f8ff 35%, #f8fafc 100%);
+      --nav-a: #053b50;
+      --nav-b: #176b87;
+      --panel: #ffffff;
+      --assistant: #f8fbff;
+      --user: #e9f8f4;
+      --line: #d9e6ef;
+      --text: #123;
+      --muted: #557;
+    }
+    body { background: var(--bg); color: var(--text); }
+    .navbar { background: linear-gradient(115deg, var(--nav-a), var(--nav-b)) !important; }
+    .logo-badge { background: #fff; padding: 4px 8px; border-radius: 6px; display: inline-flex; align-items: center; }
+    .card { border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 8px 28px rgba(10, 30, 60, .08); }
+    .chat-window { max-height: 58vh; overflow-y: auto; }
+    .bubble { border-radius: 12px; padding: 12px 14px; white-space: pre-wrap; border: 1px solid var(--line); }
+    .bubble-user { background: var(--user); }
+    .bubble-assistant { background: var(--assistant); }
+    .result-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+    .meta-chip {
+      background: #eef6ff;
+      border: 1px solid #cfe2ff;
+      border-radius: 999px;
+      padding: 3px 10px;
+      font-size: .82rem;
+      color: #0b4f8a;
+    }
+    .assistant-table-wrap { overflow-x: auto; }
+    .assistant-table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      margin-top: 6px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      font-size: .9rem;
+      background: #fff;
+    }
+    .assistant-table th,
+    .assistant-table td {
+      border-bottom: 1px solid var(--line);
+      border-right: 1px solid var(--line);
+      padding: 8px 10px;
+      vertical-align: top;
+      text-align: left;
+    }
+    .assistant-table th:last-child,
+    .assistant-table td:last-child { border-right: none; }
+    .assistant-table tr:last-child td { border-bottom: none; }
+    .assistant-table th {
+      background: #edf6ff;
+      color: #0f4673;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    .section-title { font-weight: 700; color: #0f4673; margin: 10px 0 6px 0; }
+    .plain-lines { margin: 0; padding-left: 18px; color: var(--muted); }
+  </style>
+</head>
+<body>
+
+  <nav class="navbar navbar-dark px-4 py-3">
+    <span class="navbar-brand fw-bold fs-5 d-flex align-items-center gap-2">
+      <span class="logo-badge"><img src="{{ url_for('static', filename='img/logo.png') }}" alt="Logo" height="28"></span>
+      Patch Lookup Chatbot
+    </span>
+    <div class="d-flex gap-2">
+      <a href="{{ url_for('dashboard') }}" class="btn btn-outline-light btn-sm">
+        <i class="bi bi-arrow-left me-1"></i> Back to Dashboard
+      </a>
+      <a href="{{ url_for('logout') }}" class="btn btn-outline-light btn-sm">
+        <i class="bi bi-box-arrow-right me-1"></i> Logout
+      </a>
+    </div>
+  </nav>
+
+  <div class="container py-4" style="max-width: 920px;">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}
+        <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+          {{ message }}
+          <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+      {% endfor %}
+    {% endwith %}
+
+    <div class="card mb-3">
+      <div class="card-body">
+        <h5 class="mb-2">How to ask</h5>
+        <p class="text-muted mb-0">Type a message like: <strong>File list from Patch 1936 of DENSOCLOUD</strong></p>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header bg-white fw-semibold">Conversation</div>
+      <div class="card-body chat-window" id="chatWindow">
+        {% if history %}
+          {% for item in history %}
+            <div class="mb-3">
+              <div class="small text-muted mb-1">{{ 'You' if item.role == 'user' else 'Bot' }}</div>
+              <div
+                class="bubble {{ 'bubble-user' if item.role == 'user' else 'bubble-assistant' }}"
+                {% if item.role == 'assistant' %}data-assistant-message="1"{% endif %}
+              >{{ item.text }}</div>
+            </div>
+          {% endfor %}
+        {% else %}
+          <p class="text-muted mb-0">No messages yet. Ask for an instance and patch number.</p>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-body">
+        <form method="POST" action="{{ url_for('chatbot') }}" class="d-flex gap-2">
+          <input type="text" class="form-control" name="message" placeholder="File list from Patch 8546 of UPSHC" required autofocus />
+          <button type="submit" class="btn btn-primary"><i class="bi bi-send me-1"></i>Send</button>
+        </form>
+        <form method="POST" action="{{ url_for('clear_chatbot') }}" class="mt-2 text-end">
+          <button type="submit" class="btn btn-outline-secondary btn-sm">Clear Chat</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+    function parseDataRow(line) {
+      const body = (line || '').replace(/^\s*-\s*/, '').trim();
+      if (!body || body.indexOf('=') === -1) return null;
+
+      const entries = body.split(';').map((part) => part.trim()).filter(Boolean);
+      const row = {};
+      let hasKey = false;
+
+      entries.forEach((entry) => {
+        const idx = entry.indexOf('=');
+        if (idx <= 0) return;
+        const key = entry.slice(0, idx).trim();
+        const value = entry.slice(idx + 1).trim();
+        if (!key) return;
+        row[key] = value;
+        hasKey = true;
+      });
+
+      return hasKey ? row : null;
+    }
+
+    function createTextElement(tagName, text, className) {
+      const node = document.createElement(tagName);
+      if (className) node.className = className;
+      node.textContent = text;
+      return node;
+    }
+
+    function renderAssistantMessage(container) {
+      const original = container.textContent || '';
+      const lines = original.split(/\r?\n/).map((line) => line.trimEnd());
+      if (!lines.length) return;
+
+      const metaPairs = [];
+      const sections = [];
+      const passthroughLines = [];
+
+      for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i].trim();
+        if (!line) continue;
+
+        const metaMatch = line.match(/^([A-Za-z0-9 _'()\/-]+):\s*(.+)$/);
+        if (metaMatch && !line.includes('row(s)') && !line.startsWith('Patch Status Stages')) {
+          const key = metaMatch[1].trim();
+          const value = metaMatch[2].trim();
+          if (key && value) {
+            metaPairs.push({ key, value });
+            continue;
+          }
+        }
+
+        const sectionMatch = line.match(/^(.+):\s+(\d+)\s+row\(s\)$/i);
+        if (sectionMatch) {
+          const title = sectionMatch[1].trim();
+          const total = sectionMatch[2].trim();
+          const rows = [];
+          const extras = [];
+
+          let j = i + 1;
+          while (j < lines.length) {
+            const current = lines[j].trim();
+            if (!current) {
+              j += 1;
+              continue;
+            }
+            if (/^.+:\s+\d+\s+row\(s\)$/i.test(current)) {
+              break;
+            }
+
+            if (current.startsWith('-')) {
+              const parsed = parseDataRow(current);
+              if (parsed) {
+                rows.push(parsed);
+              } else {
+                extras.push(current.replace(/^\s*-\s*/, '').trim());
+              }
+            } else {
+              extras.push(current);
+            }
+            j += 1;
+          }
+
+          sections.push({ title, total, rows, extras });
+          i = j - 1;
+          continue;
+        }
+
+        passthroughLines.push(line);
+      }
+
+      if (!metaPairs.length && !sections.length && !passthroughLines.length) {
+        return;
+      }
+
+      container.innerHTML = '';
+      container.style.whiteSpace = 'normal';
+
+      if (metaPairs.length) {
+        const metaWrap = document.createElement('div');
+        metaWrap.className = 'result-meta';
+        metaPairs.forEach((item) => {
+          const chip = document.createElement('span');
+          chip.className = 'meta-chip';
+          chip.textContent = `${item.key}: ${item.value}`;
+          metaWrap.appendChild(chip);
+        });
+        container.appendChild(metaWrap);
+      }
+
+      sections.forEach((section) => {
+        container.appendChild(createTextElement('div', `${section.title} (${section.total} rows)`, 'section-title'));
+
+        if (section.rows.length) {
+          const tableWrap = document.createElement('div');
+          tableWrap.className = 'assistant-table-wrap';
+          const table = document.createElement('table');
+          table.className = 'assistant-table';
+
+          const columns = [];
+          section.rows.forEach((row) => {
+            Object.keys(row).forEach((key) => {
+              if (!columns.includes(key)) columns.push(key);
+            });
+          });
+
+          const thead = document.createElement('thead');
+          const headRow = document.createElement('tr');
+          columns.forEach((col) => {
+            headRow.appendChild(createTextElement('th', col));
+          });
+          thead.appendChild(headRow);
+          table.appendChild(thead);
+
+          const tbody = document.createElement('tbody');
+          section.rows.forEach((row) => {
+            const tr = document.createElement('tr');
+            columns.forEach((col) => {
+              tr.appendChild(createTextElement('td', row[col] || '-'));
+            });
+            tbody.appendChild(tr);
+          });
+          table.appendChild(tbody);
+          tableWrap.appendChild(table);
+          container.appendChild(tableWrap);
+        }
+
+        if (section.extras.length) {
+          const ul = document.createElement('ul');
+          ul.className = 'plain-lines mt-2';
+          section.extras.forEach((line) => {
+            ul.appendChild(createTextElement('li', line));
+          });
+          container.appendChild(ul);
+        }
+      });
+
+      if (passthroughLines.length) {
+        const ul = document.createElement('ul');
+        ul.className = 'plain-lines mt-2';
+        passthroughLines.forEach((line) => {
+          ul.appendChild(createTextElement('li', line));
+        });
+        container.appendChild(ul);
+      }
+    }
+
+    document.querySelectorAll('[data-assistant-message="1"]').forEach((node) => {
+      renderAssistantMessage(node);
+    });
+
+    const chatWindow = document.getElementById('chatWindow');
+    if (chatWindow) {
+      chatWindow.scrollTop = chatWindow.scrollHeight;
+    }
+  </script>
+</body>
+</html>
+

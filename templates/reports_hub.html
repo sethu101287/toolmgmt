@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Reports</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet" />
+  <link href="{{ url_for('static', filename='css/theme.css') }}" rel="stylesheet" />
+  <style>
+    body { background: #F5F8FC; font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif; }
+    body.embedded { background: #fff; }
+    .card-soft { border: 1px solid #DCE6F2; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,.08); background: #fff; }
+    .report-row .report-field[disabled] { background: #e9ecef; }
+    .report-card { border-left: 5px solid #14B8A6; transition: box-shadow .15s ease, transform .15s ease; position: relative; z-index: 1; }
+    .report-card:hover { box-shadow: 0 8px 24px rgba(30,41,59,.12); transform: translateY(-2px); }
+    .report-card.dropdown-open { z-index: 30; }
+    .report-card .report-icon {
+      width: 40px; height: 40px; border-radius: 10px;
+      background: #ccfbf1; color: #14B8A6;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.2rem;
+      transition: filter .15s ease;
+    }
+    .report-card:hover .report-icon { filter: brightness(.92); }
+
+    /* Report category accents: QA Test Status=Teal, Product YTT WIP=Purple, IMPL YTT WIP=Blue, future=Orange/Pink/Cyan */
+    .report-card.cat-monitoring { border-left-color: #14B8A6; }
+    .report-card.cat-monitoring .report-icon { background: #ccfbf1; color: #0d9488; }
+    .report-card.cat-analytics { border-left-color: #8B5CF6; }
+    .report-card.cat-analytics .report-icon { background: #ede9fe; color: #7c3aed; }
+    .report-card.cat-operations { border-left-color: #3B82F6; }
+    .report-card.cat-operations .report-icon { background: #dbeafe; color: #2563eb; }
+    .report-card.cat-patch { border-left-color: #F97316; }
+    .report-card.cat-patch .report-icon { background: #ffedd5; color: #ea580c; }
+    .report-card.cat-pink { border-left-color: #EC4899; }
+    .report-card.cat-pink .report-icon { background: #fce7f3; color: #db2777; }
+    .report-card.cat-cyan { border-left-color: #06B6D4; }
+    .report-card.cat-cyan .report-icon { background: #cffafe; color: #0891b2; }
+    .report-cat-badge {
+      font-size: .68rem; font-weight: 600; padding: .15rem .55rem; border-radius: 999px;
+    }
+    .report-cat-badge.cat-monitoring { background: #ccfbf1; color: #0d9488; }
+    .report-cat-badge.cat-analytics { background: #ede9fe; color: #7c3aed; }
+    .report-cat-badge.cat-operations { background: #dbeafe; color: #2563eb; }
+    .report-cat-badge.cat-patch { background: #ffedd5; color: #ea580c; }
+    .report-cat-badge.cat-pink { background: #fce7f3; color: #db2777; }
+    .report-cat-badge.cat-cyan { background: #cffafe; color: #0891b2; }
+    .dropdown-check-list { position: relative; }
+    .dropdown-check-menu {
+      display: none;
+      position: absolute;
+      top: 100%; left: 0; right: 0;
+      z-index: 1050;
+      margin-top: 2px;
+      background: #fff;
+      border: 1px solid #ced4da;
+      border-radius: .375rem;
+      max-height: 220px;
+      overflow-y: auto;
+      box-shadow: 0 4px 12px rgba(0,0,0,.12);
+      padding: .25rem 0;
+    }
+    .dropdown-check-menu.show { display: block; }
+    .dropdown-check-item {
+      display: block;
+      padding: .25rem .75rem;
+      margin-bottom: 0;
+      cursor: pointer;
+    }
+    .dropdown-check-item:hover { background: #f1f3f5; }
+    .btn-sky {
+      background: linear-gradient(135deg, #2563EB, #06B6D4);
+      border-color: transparent;
+      color: #fff;
+      transition: transform .12s ease, box-shadow .12s ease, filter .12s ease;
+    }
+    .btn-sky:hover, .btn-sky:focus {
+      filter: brightness(1.06);
+      box-shadow: 0 6px 16px rgba(37,99,235,.35);
+      transform: translateY(-1px);
+      color: #fff;
+    }
+  </style>
+</head>
+<body class="{{ 'embedded' if embedded else '' }}">
+  <div class="container-fluid py-3 px-3">
+    {% set has_test_status = session.get('is_admin') or 'test_status' in session.get('reports', []) %}
+
+    {% if has_test_status %}
+    {% if test_status_error %}
+      <div class="alert alert-danger">{{ test_status_error }}</div>
+    {% endif %}
+    <div class="card card-soft report-card cat-monitoring mb-3">
+      <div class="card-body">
+        <div class="row g-3 align-items-center report-row" data-report="test_status">
+          <div class="col-md-2">
+            <div class="form-check d-flex align-items-center gap-2">
+              <input class="form-check-input report-toggle mt-0" type="checkbox" id="chk_test_status">
+              <label class="form-check-label fw-semibold d-flex align-items-center gap-2" for="chk_test_status">
+                <span class="report-icon icon-float"><i class="bi bi-clipboard2-check-fill"></i></span>
+                {{ report_definitions.get('test_status', 'Test Status Report') }}
+                <span class="badge report-cat-badge cat-monitoring"></span>
+              </label>
+            </div>
+          </div>
+          <div class="col-md-2">
+            <div class="dropdown-check-list" id="instanceDropdown_test_status">
+              <button type="button" class="btn btn-outline-secondary btn-sm report-field dropdown-check-toggle w-100 d-flex justify-content-between align-items-center" disabled>
+                <span class="selected-label">ALL</span>
+                <i class="bi bi-chevron-down"></i>
+              </button>
+              <div class="dropdown-check-menu">
+                <div class="px-2 pb-1">
+                  <input type="text" class="form-control form-control-sm instance-search" placeholder="Search Instance ID...">
+                </div>
+                <label class="dropdown-check-item fw-semibold">
+                  <input type="checkbox" class="form-check-input me-1 chk-all" checked>ALL
+                </label>
+                <hr class="my-1">
+                {% for instance_id in test_status_instance_ids %}
+                <label class="dropdown-check-item instance-option">
+                  <input type="checkbox" class="form-check-input me-1 chk-instance" value="{{ instance_id }}">{{ instance_id }}
+                </label>
+                {% endfor %}
+                <div class="no-results-msg text-muted small px-2 py-1 d-none">No matching Instance ID.</div>
+              </div>
+            </div>
+          </div>
+          <div class="col-md-2">
+            <div class="dropdown-check-list" id="statusDropdown_test_status">
+              <button type="button" class="btn btn-outline-secondary btn-sm report-field dropdown-check-toggle w-100 d-flex justify-content-between align-items-center" disabled>
+                <span class="selected-label">ALL</span>
+                <i class="bi bi-chevron-down"></i>
+              </button>
+              <div class="dropdown-check-menu">
+                <label class="dropdown-check-item fw-semibold">
+                  <input type="checkbox" class="form-check-input me-1 chk-all" checked>ALL
+                </label>
+                <hr class="my-1">
+                {% for status_value in test_status_values %}
+                <label class="dropdown-check-item">
+                  <input type="checkbox" class="form-check-input me-1 chk-instance" value="{{ status_value }}">{{ status_value }}
+                </label>
+                {% endfor %}
+              </div>
+            </div>
+          </div>
+          <div class="col-md-2">
+            <input type="date" class="form-control form-control-sm report-field" id="start_test_status" disabled>
+          </div>
+          <div class="col-md-2">
+            <input type="date" class="form-control form-control-sm report-field" id="end_test_status" disabled>
+          </div>
+          <div class="col-md-2">
+            <button type="button" class="btn btn-sky btn-sm w-100 report-field" id="btn_test_status" disabled>
+              <i class="bi bi-download me-1"></i>Download Excel
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    {% set has_product_ytt_wip = session.get('is_admin') or 'product_ytt_wip' in session.get('reports', []) %}
+    {% if has_product_ytt_wip %}
+    {% if product_ytt_wip_error %}
+      <div class="alert alert-danger">{{ product_ytt_wip_error }}</div>
+    {% endif %}
+    <div class="card card-soft report-card cat-analytics mb-3">
+      <div class="card-body">
+        <div class="row g-3 align-items-center report-row" data-report="product_ytt_wip">
+          <div class="col-md-3">
+            <div class="form-check d-flex align-items-center gap-2">
+              <input class="form-check-input report-toggle mt-0" type="checkbox" id="chk_product_ytt_wip">
+              <label class="form-check-label fw-semibold d-flex align-items-center gap-2" for="chk_product_ytt_wip">
+                <span class="report-icon icon-float"><i class="bi bi-graph-up-arrow"></i></span>
+                {{ report_definitions.get('product_ytt_wip', 'Product YTT WIP') }}
+                <span class="badge report-cat-badge cat-analytics"></span>
+              </label>
+            </div>
+          </div>
+          <div class="col-md-3">
+            <div class="dropdown-check-list" id="instanceDropdown_product_ytt_wip">
+              <button type="button" class="btn btn-outline-secondary btn-sm report-field dropdown-check-toggle w-100 d-flex justify-content-between align-items-center" disabled>
+                <span class="selected-label">All Instance IDs</span>
+                <i class="bi bi-chevron-down"></i>
+              </button>
+              <div class="dropdown-check-menu">
+                <div class="px-2 pb-1">
+                  <input type="text" class="form-control form-control-sm instance-search" placeholder="Search Instance ID...">
+                </div>
+                <label class="dropdown-check-item fw-semibold">
+                  <input type="checkbox" class="form-check-input me-1 chk-all" checked>All Instance IDs
+                </label>
+                <hr class="my-1">
+                {% for instance_id in product_ytt_wip_instance_ids %}
+                <label class="dropdown-check-item instance-option">
+                  <input type="checkbox" class="form-check-input me-1 chk-instance" value="{{ instance_id }}">{{ instance_id }}
+                </label>
+                {% endfor %}
+                <div class="no-results-msg text-muted small px-2 py-1 d-none">No matching Instance ID.</div>
+              </div>
+            </div>
+          </div>
+          <div class="col-md-2">
+            <input type="date" class="form-control form-control-sm report-field" id="start_product_ytt_wip" disabled>
+          </div>
+          <div class="col-md-2">
+            <input type="date" class="form-control form-control-sm report-field" id="end_product_ytt_wip" disabled>
+          </div>
+          <div class="col-md-2">
+            <button type="button" class="btn btn-sky btn-sm w-100 report-field" id="btn_product_ytt_wip" disabled>
+              <i class="bi bi-download me-1"></i>Download Excel
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    {% set has_impl_ytt_wip = session.get('is_admin') or 'impl_ytt_wip' in session.get('reports', []) %}
+    {% if has_impl_ytt_wip %}
+    {% if impl_ytt_wip_error %}
+      <div class="alert alert-danger">{{ impl_ytt_wip_error }}</div>
+    {% endif %}
+    <div class="card card-soft report-card cat-operations mb-3">
+      <div class="card-body">
+        <div class="row g-3 align-items-center report-row" data-report="impl_ytt_wip">
+          <div class="col-md-3">
+            <div class="form-check d-flex align-items-center gap-2">
+              <input class="form-check-input report-toggle mt-0" type="checkbox" id="chk_impl_ytt_wip">
+              <label class="form-check-label fw-semibold d-flex align-items-center gap-2" for="chk_impl_ytt_wip">
+                <span class="report-icon icon-float"><i class="bi bi-diagram-3-fill"></i></span>
+                {{ report_definitions.get('impl_ytt_wip', 'IMPL YTT WIP') }}
+                <span class="badge report-cat-badge cat-operations"></span>
+              </label>
+            </div>
+          </div>
+          <div class="col-md-3">
+            <div class="dropdown-check-list" id="instanceDropdown_impl_ytt_wip">
+              <button type="button" class="btn btn-outline-secondary btn-sm report-field dropdown-check-toggle w-100 d-flex justify-content-between align-items-center" disabled>
+                <span class="selected-label">All Instance IDs</span>
+                <i class="bi bi-chevron-down"></i>
+              </button>
+              <div class="dropdown-check-menu">
+                <div class="px-2 pb-1">
+                  <input type="text" class="form-control form-control-sm instance-search" placeholder="Search Instance ID...">
+                </div>
+                <label class="dropdown-check-item fw-semibold">
+                  <input type="checkbox" class="form-check-input me-1 chk-all" checked>All Instance IDs
+                </label>
+                <hr class="my-1">
+                {% for instance_id in impl_ytt_wip_instance_ids %}
+                <label class="dropdown-check-item instance-option">
+                  <input type="checkbox" class="form-check-input me-1 chk-instance" value="{{ instance_id }}">{{ instance_id }}
+                </label>
+                {% endfor %}
+                <div class="no-results-msg text-muted small px-2 py-1 d-none">No matching Instance ID.</div>
+              </div>
+            </div>
+          </div>
+          <div class="col-md-2">
+            <input type="date" class="form-control form-control-sm report-field" id="start_impl_ytt_wip" disabled>
+          </div>
+          <div class="col-md-2">
+            <input type="date" class="form-control form-control-sm report-field" id="end_impl_ytt_wip" disabled>
+          </div>
+          <div class="col-md-2">
+            <button type="button" class="btn btn-sky btn-sm w-100 report-field" id="btn_impl_ytt_wip" disabled>
+              <i class="bi bi-download me-1"></i>Download Excel
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    {# Future reports: add one card block per report key here, following the pattern above. #}
+
+    {% set has_any_report = session.get('is_admin') or session.get('reports') %}
+    {% if not has_any_report %}
+    <div class="text-center text-muted py-5">
+      <i class="bi bi-lock fs-1"></i>
+      <p class="mt-2">No reports assigned. Contact your administrator.</p>
+    </div>
+    {% endif %}
+  </div>
+
+  <script>
+    // Generic checkbox-enables-fields behavior for each report row.
+    document.querySelectorAll('.report-row').forEach((row) => {
+      const toggle = row.querySelector('.report-toggle');
+      const fields = row.querySelectorAll('.report-field');
+      if (!toggle) return;
+      toggle.addEventListener('change', () => {
+        fields.forEach((field) => { field.disabled = !toggle.checked; });
+        if (!toggle.checked) {
+          row.querySelectorAll('.dropdown-check-menu.show').forEach((m) => m.classList.remove('show'));
+          row.closest('.report-card')?.classList.remove('dropdown-open');
+        }
+      });
+    });
+
+    // Checkbox-based multi-select dropdown for Instance ID / Test Status (with an ALL option,
+    // and an optional live search box that filters the '.instance-option' items).
+    function initCheckDropdown(wrapperId) {
+      const wrapper = document.getElementById(wrapperId);
+      if (!wrapper) return;
+      const toggleBtn = wrapper.querySelector('.dropdown-check-toggle');
+      const menu = wrapper.querySelector('.dropdown-check-menu');
+      const label = wrapper.querySelector('.selected-label');
+      const searchBox = wrapper.querySelector('.instance-search');
+      const noResultsMsg = wrapper.querySelector('.no-results-msg');
+      const allChk = wrapper.querySelector('.chk-all');
+      const instChks = Array.from(wrapper.querySelectorAll('.chk-instance'));
+
+      function updateLabel() {
+        const checked = instChks.filter((c) => c.checked);
+        if (allChk.checked || checked.length === 0) {
+          label.textContent = 'ALL';
+        } else if (checked.length === 1) {
+          label.textContent = checked[0].value;
+        } else {
+          label.textContent = checked.length + ' selected';
+        }
+      }
+
+      function filterOptions(term) {
+        const needle = term.trim().toLowerCase();
+        let visibleCount = 0;
+        wrapper.querySelectorAll('.instance-option').forEach((opt) => {
+          const text = opt.textContent.trim().toLowerCase();
+          const match = !needle || text.includes(needle);
+          opt.classList.toggle('d-none', !match);
+          if (match) visibleCount += 1;
+        });
+        if (noResultsMsg) noResultsMsg.classList.toggle('d-none', visibleCount > 0);
+      }
+
+      toggleBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (toggleBtn.disabled) return;
+        const card = wrapper.closest('.report-card');
+        const opening = !menu.classList.contains('show');
+        document.querySelectorAll('.dropdown-check-menu.show').forEach((m) => { if (m !== menu) m.classList.remove('show'); });
+        document.querySelectorAll('.report-card.dropdown-open').forEach((c) => { if (c !== card) c.classList.remove('dropdown-open'); });
+        menu.classList.toggle('show', opening);
+        if (card) card.classList.toggle('dropdown-open', opening);
+        if (opening && searchBox) { searchBox.value = ''; filterOptions(''); searchBox.focus(); }
+      });
+      menu.addEventListener('click', (e) => e.stopPropagation());
+
+      if (searchBox) {
+        searchBox.addEventListener('click', (e) => e.stopPropagation());
+        searchBox.addEventListener('input', () => filterOptions(searchBox.value));
+      }
+
+      allChk.addEventListener('change', () => {
+        if (allChk.checked) { instChks.forEach((c) => { c.checked = false; }); }
+        updateLabel();
+      });
+
+      instChks.forEach((chk) => {
+        chk.addEventListener('change', () => {
+          if (chk.checked) { allChk.checked = false; }
+          if (instChks.every((c) => !c.checked)) { allChk.checked = true; }
+          updateLabel();
+        });
+      });
+
+      wrapper.getSelectedInstances = () => (allChk.checked ? [] : instChks.filter((c) => c.checked).map((c) => c.value));
+      updateLabel();
+    }
+
+    document.addEventListener('click', () => {
+      document.querySelectorAll('.dropdown-check-menu.show').forEach((m) => m.classList.remove('show'));
+      document.querySelectorAll('.report-card.dropdown-open').forEach((c) => c.classList.remove('dropdown-open'));
+    });
+
+    initCheckDropdown('instanceDropdown_test_status');
+    initCheckDropdown('statusDropdown_test_status');
+    initCheckDropdown('instanceDropdown_product_ytt_wip');
+    initCheckDropdown('instanceDropdown_impl_ytt_wip');
+
+    const btnTestStatus = document.getElementById('btn_test_status');
+    if (btnTestStatus) {
+      btnTestStatus.addEventListener('click', () => {
+        const startDate = document.getElementById('start_test_status').value;
+        const endDate = document.getElementById('end_test_status').value;
+        if (!startDate || !endDate) {
+          alert('Please select both Start Date and End Date.');
+          return;
+        }
+        if (startDate > endDate) {
+          alert('Start Date must be on or before End Date.');
+          return;
+        }
+
+        const params = new URLSearchParams({ start_date: startDate, end_date: endDate });
+        const instanceWrapper = document.getElementById('instanceDropdown_test_status');
+        const selectedInstances = instanceWrapper.getSelectedInstances ? instanceWrapper.getSelectedInstances() : [];
+        selectedInstances.forEach((id) => params.append('instance_id', id));
+        const statusWrapper = document.getElementById('statusDropdown_test_status');
+        const selectedStatuses = statusWrapper.getSelectedInstances ? statusWrapper.getSelectedInstances() : [];
+        selectedStatuses.forEach((s) => params.append('test_status', s));
+        window.location.href = '/reports/test-status/export?' + params.toString();
+      });
+    }
+
+    const btnProductYttWip = document.getElementById('btn_product_ytt_wip');
+    if (btnProductYttWip) {
+      btnProductYttWip.addEventListener('click', () => {
+        const startDate = document.getElementById('start_product_ytt_wip').value;
+        const endDate = document.getElementById('end_product_ytt_wip').value;
+        if (!startDate || !endDate) {
+          alert('Please select both Start Date and End Date.');
+          return;
+        }
+        if (startDate > endDate) {
+          alert('Start Date must be on or before End Date.');
+          return;
+        }
+        const params = new URLSearchParams({ start_date: startDate, end_date: endDate });
+        const instanceWrapper = document.getElementById('instanceDropdown_product_ytt_wip');
+        const selectedInstances = instanceWrapper && instanceWrapper.getSelectedInstances ? instanceWrapper.getSelectedInstances() : [];
+        selectedInstances.forEach((id) => params.append('instance_id', id));
+        window.location.href = '/reports/product-ytt-wip/export?' + params.toString();
+      });
+    }
+
+    const btnImplYttWip = document.getElementById('btn_impl_ytt_wip');
+    if (btnImplYttWip) {
+      btnImplYttWip.addEventListener('click', () => {
+        const startDate = document.getElementById('start_impl_ytt_wip').value;
+        const endDate = document.getElementById('end_impl_ytt_wip').value;
+        if (!startDate || !endDate) {
+          alert('Please select both Start Date and End Date.');
+          return;
+        }
+        if (startDate > endDate) {
+          alert('Start Date must be on or before End Date.');
+          return;
+        }
+        const params = new URLSearchParams({ start_date: startDate, end_date: endDate });
+        const instanceWrapper = document.getElementById('instanceDropdown_impl_ytt_wip');
+        const selectedInstances = instanceWrapper && instanceWrapper.getSelectedInstances ? instanceWrapper.getSelectedInstances() : [];
+        selectedInstances.forEach((id) => params.append('instance_id', id));
+        window.location.href = '/reports/impl-ytt-wip/export?' + params.toString();
+      });
+    }
+  </script>
+</body>
+</html>

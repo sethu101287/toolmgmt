@@ -1,0 +1,6 @@
+.env
+database.db
+data/instance_secret.key
+__pycache__/
+*.pyc
+.venv/

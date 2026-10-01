@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Instance Details</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet" />
+  <link href="{{ url_for('static', filename='css/theme.css') }}" rel="stylesheet" />
+  <style>
+    body { background: linear-gradient(160deg, #F8FBFF, #EEF8FF); font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif; min-height: 100vh; }
+    body.embedded { background: linear-gradient(160deg, #F8FBFF, #EEF8FF); }
+    .card-soft { border: 1px solid #DCE6F2; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,.08); background: #fff; }
+    .instance-search-wrap { position: relative; }
+    .instance-search-results {
+      position: absolute; top: 100%; left: 0; right: 0; z-index: 20;
+      max-height: 260px; overflow-y: auto; background: #fff;
+      border: 1px solid #dee2e6; border-top: none; border-radius: 0 0 8px 8px;
+      box-shadow: 0 6px 16px rgba(0,0,0,.12); display: none;
+    }
+    .instance-search-results.show { display: block; }
+    .instance-search-results button {
+      display: block; width: 100%; text-align: left; border: none; background: none;
+      padding: .5rem .75rem; font-size: .9rem;
+    }
+    .instance-search-results button:hover,
+    .instance-search-results button.active { background: #e9ecef; }
+    .detail-row { display: flex; gap: .5rem; align-items: center; padding: .4rem 0; border-bottom: 1px dashed #e0e0e0; }
+    .detail-row:last-child { border-bottom: none; }
+    .detail-label { flex: 0 0 160px; font-weight: 600; color: #495057; font-size: .85rem; }
+    .detail-value { flex: 1 1 auto; word-break: break-all; font-size: .9rem; }
+    .copy-btn { padding: 0 .4rem; }
+    .config-card {
+      border: 1px solid #DCE6F2; border-left: 4px solid #14B8A6; border-radius: 10px;
+      padding: .75rem 1rem; margin-bottom: .75rem; background: #fff;
+      transition: box-shadow .15s ease, transform .15s ease;
+    }
+    .config-card:hover { box-shadow: 0 6px 18px rgba(30,41,59,.1); transform: translateY(-1px); }
+    .dbtype-fields { display: none; }
+    .dbtype-fields.show { display: block; }
+    .text-teal { color: #14B8A6 !important; }
+    .btn-teal { background: #14B8A6; border-color: #14B8A6; color: #fff; }
+    .btn-teal:hover, .btn-teal:focus { background: #0d9488; border-color: #0d9488; color: #fff; }
+    .btn-outline-teal { color: #0d9488; border-color: #14B8A6; }
+    .btn-outline-teal:hover { background: #14B8A6; border-color: #14B8A6; color: #fff; }
+    .env-badge { font-weight: 600; border-radius: 999px; padding: .3rem .7rem; }
+    .env-badge.env-prod { background: #EF4444; color: #fff; }
+    .env-badge.env-uat { background: #F59E0B; color: #fff; }
+    .env-badge.env-qa { background: #10B981; color: #fff; }
+    .env-badge.env-dev { background: #14B8A6; color: #fff; }
+    .env-badge.env-stage { background: #8B5CF6; color: #fff; }
+    .env-badge.env-default { background: #64748B; color: #fff; }
+  </style>
+</head>
+<body class="{{ 'embedded' if embedded else '' }}">
+  <div class="container-fluid py-3 px-3">
+
+    <div class="card card-soft mb-3">
+      <div class="card-body">
+        <h5 class="mb-3"><i class="bi bi-diagram-3-fill me-2 text-teal icon-float"></i>Instance Details</h5>
+
+        <div class="row g-3">
+          <div class="col-md-6">
+            <label class="form-label small text-muted">Instance ID</label>
+            <div class="instance-search-wrap">
+              <input type="text" id="instanceSearchInput" class="form-control" placeholder="Search Instance ID..." autocomplete="off">
+              <div class="instance-search-results" id="instanceSearchResults"></div>
+            </div>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label small text-muted">Environment <span class="text-danger">*</span></label>
+            <select class="form-select" id="environmentSelect" disabled>
+              <option value="">-- Select Environment --</option>
+              {% for env in environments %}
+              <option value="{{ env }}">{{ env }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+
+        <div id="noInstanceSelected" class="text-muted small mt-3">Select an Instance ID and Environment to view its details.</div>
+        <div id="instanceDetailsMsg" class="small mt-2"></div>
+      </div>
+    </div>
+
+    <div class="row g-3" id="instancePanels" style="display:none;">
+      <div class="col-lg-7">
+        <div class="card card-soft h-100">
+          <div class="card-body">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+              <h6 class="mb-0"><i class="bi bi-clipboard2-data-fill me-2 text-teal icon-float"></i>Configured Details</h6>
+              <span id="instanceEnvBadge" class="badge bg-secondary"></span>
+            </div>
+            <div id="noDataMsg" class="text-muted small py-3" style="display:none;">No data available for selected instance.</div>
+            <div id="configsContainer"></div>
+          </div>
+        </div>
+      </div>
+
+      {% if session.get('is_admin') %}
+      <div class="col-lg-5">
+        <div class="card card-soft h-100">
+          <div class="card-body">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+              <h6 class="mb-0"><i class="bi bi-pencil-square me-2 text-teal icon-float"></i>Add / Edit Configuration</h6>
+              <button type="button" class="btn btn-sm btn-outline-danger" id="btnDeleteInstance"><i class="bi bi-trash3 me-1"></i>Delete</button>
+            </div>
+            <form id="instanceForm">
+              <div class="mb-2">
+                <label class="form-label small text-muted">Web URL</label>
+                <input type="text" class="form-control form-control-sm" id="fWebUrl">
+              </div>
+              <div class="mb-2">
+                <label class="form-label small text-muted">RF URL</label>
+                <input type="text" class="form-control form-control-sm" id="fRfUrl">
+              </div>
+              <div class="mb-2">
+                <label class="form-label small text-muted">Database Type</label>
+                <select class="form-select form-select-sm" id="fDbType">
+                  <option value="">-- Select --</option>
+                  {% for t in db_types %}
+                  <option value="{{ t }}">{{ t }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+
+              <div class="dbtype-fields" data-for="Oracle,PostgreSQL,SQL Server">
+                <div class="mb-2">
+                  <label class="form-label small text-muted">Username</label>
+                  <input type="text" class="form-control form-control-sm" id="fDbUsername">
+                </div>
+                <div class="mb-2">
+                  <label class="form-label small text-muted">Password</label>
+                  <div class="input-group input-group-sm">
+                    <input type="password" class="form-control form-control-sm" id="fDbPassword" placeholder="Leave blank to keep existing password">
+                    <button type="button" class="btn btn-outline-secondary" id="btnTogglePassword" title="Show/Hide password"><i class="bi bi-eye"></i></button>
+                  </div>
+                </div>
+              </div>
+              <div class="dbtype-fields" data-for="Oracle,PostgreSQL">
+                <div class="mb-2">
+                  <label class="form-label small text-muted">Host Name</label>
+                  <input type="text" class="form-control form-control-sm" id="fDbHost">
+                </div>
+              </div>
+              <div class="dbtype-fields" data-for="Oracle,PostgreSQL,SQL Server">
+                <div class="mb-2">
+                  <label class="form-label small text-muted">Port</label>
+                  <input type="text" class="form-control form-control-sm" id="fDbPort">
+                </div>
+              </div>
+              <div class="dbtype-fields" data-for="Oracle">
+                <div class="mb-2">
+                  <label class="form-label small text-muted">SID</label>
+                  <input type="text" class="form-control form-control-sm" id="fDbSid">
+                </div>
+              </div>
+              <div class="dbtype-fields" data-for="PostgreSQL">
+                <div class="mb-2">
+                  <label class="form-label small text-muted">Database Name</label>
+                  <input type="text" class="form-control form-control-sm" id="fDbName">
+                </div>
+              </div>
+              <div class="dbtype-fields" data-for="SQL Server">
+                <div class="mb-2">
+                  <label class="form-label small text-muted">Server Name</label>
+                  <input type="text" class="form-control form-control-sm" id="fDbServerName">
+                </div>
+              </div>
+
+              <div class="mb-2">
+                <label class="form-label small text-muted">Log Path</label>
+                <input type="text" class="form-control form-control-sm" id="fLogPath">
+              </div>
+              <div class="mb-3">
+                <label class="form-label small text-muted">Daemon Path</label>
+                <input type="text" class="form-control form-control-sm" id="fDaemonPath">
+              </div>
+              <button type="submit" class="btn btn-teal btn-sm w-100"><i class="bi bi-save me-1"></i>Save</button>
+            </form>
+          </div>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+    const isAdmin = {{ (session.get('is_admin') and true or false) | tojson }};
+    const searchInput = document.getElementById('instanceSearchInput');
+    const searchResults = document.getElementById('instanceSearchResults');
+    const environmentSelect = document.getElementById('environmentSelect');
+    const noInstanceSelected = document.getElementById('noInstanceSelected');
+    const instancePanels = document.getElementById('instancePanels');
+    const instanceDetailsMsg = document.getElementById('instanceDetailsMsg');
+    const noDataMsg = document.getElementById('noDataMsg');
+    const configsContainer = document.getElementById('configsContainer');
+    const instanceEnvBadge = document.getElementById('instanceEnvBadge');
+    const instanceForm = document.getElementById('instanceForm');
+    const btnDeleteInstance = document.getElementById('btnDeleteInstance');
+    const fDbType = document.getElementById('fDbType');
+
+    let allInstanceIds = [];
+    let selectedInstanceId = null;
+    let currentConfigs = [];
+
+    function showMsg(text, ok) {
+      instanceDetailsMsg.innerHTML = text ? `<span class="${ok ? 'text-success' : 'text-danger'}">${text}</span>` : '';
+    }
+
+    async function loadInstanceIds() {
+      const res = await fetch('/api/instance-details/instance-ids');
+      const data = await res.json();
+      allInstanceIds = data.instance_ids || [];
+      if (data.error) showMsg(data.error, false);
+    }
+
+    function renderSearchResults(filter) {
+      const q = (filter || '').trim().toUpperCase();
+      const matches = allInstanceIds.filter(id => id.toUpperCase().includes(q)).slice(0, 50);
+      searchResults.innerHTML = matches.length
+        ? matches.map(id => `<button type="button" data-id="${id}">${id}</button>`).join('')
+        : '<div class="text-muted small px-3 py-2">No matching Instance ID.</div>';
+      searchResults.classList.add('show');
+    }
+
+    searchInput.addEventListener('focus', () => renderSearchResults(searchInput.value));
+    searchInput.addEventListener('input', () => renderSearchResults(searchInput.value));
+    searchResults.addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-id]');
+      if (!btn) return;
+      selectedInstanceId = btn.getAttribute('data-id');
+      searchInput.value = selectedInstanceId;
+      searchResults.classList.remove('show');
+      environmentSelect.disabled = false;
+      environmentSelect.value = '';
+      resetPanels();
+    });
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('.instance-search-wrap')) searchResults.classList.remove('show');
+    });
+
+    function resetPanels() {
+      instancePanels.style.display = 'none';
+      noInstanceSelected.style.display = '';
+      showMsg('', true);
+    }
+
+    environmentSelect.addEventListener('change', () => {
+      if (selectedInstanceId && environmentSelect.value) {
+        loadConfigs();
+      } else {
+        resetPanels();
+      }
+    });
+
+    function applyDbTypeVisibility(dbType) {
+      document.querySelectorAll('.dbtype-fields').forEach(el => {
+        const types = (el.getAttribute('data-for') || '').split(',');
+        el.classList.toggle('show', !!dbType && types.includes(dbType));
+      });
+    }
+    if (fDbType) {
+      fDbType.addEventListener('change', () => applyDbTypeVisibility(fDbType.value));
+    }
+
+    const btnTogglePassword = document.getElementById('btnTogglePassword');
+    if (btnTogglePassword) {
+      btnTogglePassword.addEventListener('click', () => {
+        const pwdInput = document.getElementById('fDbPassword');
+        const icon = btnTogglePassword.querySelector('i');
+        const showing = pwdInput.type === 'text';
+        pwdInput.type = showing ? 'password' : 'text';
+        icon.className = showing ? 'bi bi-eye' : 'bi bi-eye-slash';
+      });
+    }
+
+    function fillForm(cfg) {
+      if (!isAdmin) return;
+      fDbType.value = (cfg && cfg.db_type) || '';
+      applyDbTypeVisibility(fDbType.value);
+      document.getElementById('fWebUrl').value = (cfg && cfg.web_url) || '';
+      document.getElementById('fRfUrl').value = (cfg && cfg.rf_url) || '';
+      document.getElementById('fDbUsername').value = (cfg && cfg.db_username) || '';
+      document.getElementById('fDbPassword').value = '';
+      document.getElementById('fDbHost').value = (cfg && cfg.db_host) || '';
+      document.getElementById('fDbPort').value = (cfg && cfg.db_port) || '';
+      document.getElementById('fDbSid').value = (cfg && cfg.db_sid) || '';
+      document.getElementById('fDbName').value = (cfg && cfg.db_name) || '';
+      document.getElementById('fDbServerName').value = (cfg && cfg.db_server_name) || '';
+      document.getElementById('fLogPath').value = (cfg && cfg.log_path) || '';
+      document.getElementById('fDaemonPath').value = (cfg && cfg.daemon_path) || '';
+    }
+
+    function dbTypeSpecificRows(cfg) {
+      const rows = [];
+      if (cfg.db_username) rows.push(['Username', cfg.db_username]);
+      if (cfg.db_host) rows.push(['Host Name', cfg.db_host]);
+      if (cfg.db_port) rows.push(['Port', cfg.db_port]);
+      if (cfg.db_sid) rows.push(['SID', cfg.db_sid]);
+      if (cfg.db_name) rows.push(['Database Name', cfg.db_name]);
+      if (cfg.db_server_name) rows.push(['Server Name', cfg.db_server_name]);
+      return rows;
+    }
+
+    const ROW_ICONS = {
+      'Environment': 'bi-cloud-fill',
+      'Web URL': 'bi-globe2',
+      'RF URL': 'bi-link-45deg',
+      'Password': 'bi-shield-lock-fill',
+      'Username': 'bi-person-badge-fill',
+      'Host Name': 'bi-hdd-network-fill',
+      'Port': 'bi-ethernet',
+      'SID': 'bi-database-fill',
+      'Database Name': 'bi-database-fill',
+      'Server Name': 'bi-server',
+      'Log Path': 'bi-file-earmark-text-fill',
+      'Daemon Path': 'bi-gear-fill',
+      'Last Updated': 'bi-clock-history',
+    };
+    function rowIcon(label) {
+      return `<i class="bi ${ROW_ICONS[label] || 'bi-info-circle'} me-1 text-teal"></i>`;
+    }
+
+    function passwordRow(cfg, idx) {
+      if (!cfg.has_password) return '';
+      const revealBtn = `<button type="button" class="btn btn-sm btn-outline-secondary reveal-password-btn" data-idx="${idx}" title="Show/Hide password"><i class="bi bi-eye"></i></button>`;
+      return `
+        <div class="detail-row">
+          <div class="detail-label">${rowIcon('Password')}Password</div>
+          <div class="detail-value d-flex align-items-center gap-2">
+            <span id="password_${idx}">••••••••</span>
+            ${revealBtn}
+          </div>
+        </div>`;
+    }
+
+    function copyableRow(label, id, value) {
+      return `
+        <div class="detail-row">
+          <div class="detail-label">${rowIcon(label)}${label}</div>
+          <div class="detail-value d-flex align-items-center gap-2">
+            <span id="${id}">${value ? escapeHtml(value) : '-'}</span>
+            <button type="button" class="btn btn-sm btn-outline-secondary copy-btn" data-copy-target="${id}" title="Copy"><i class="bi bi-clipboard"></i></button>
+          </div>
+        </div>`;
+    }
+
+    function escapeHtml(value) {
+      const div = document.createElement('div');
+      div.textContent = value == null ? '' : String(value);
+      return div.innerHTML;
+    }
+
+    function renderConfigs(configs) {
+      currentConfigs = configs || [];
+      if (!currentConfigs.length) {
+        noDataMsg.style.display = '';
+        configsContainer.innerHTML = '';
+        return;
+      }
+      noDataMsg.style.display = 'none';
+      configsContainer.innerHTML = currentConfigs.map((cfg, idx) => {
+        const dbRows = dbTypeSpecificRows(cfg).map(([label, value]) =>
+          `<div class="detail-row"><div class="detail-label">${rowIcon(label)}${label}</div><div class="detail-value">${escapeHtml(value)}</div></div>`
+        ).join('');
+        const dbTypeIcon = cfg.db_type === 'SQL Server' ? 'bi-server' : 'bi-database-fill-gear';
+        return `
+          <div class="config-card">
+            <div class="d-flex justify-content-between align-items-center mb-1">
+              <strong><i class="bi ${dbTypeIcon} me-2 text-teal icon-float"></i>${cfg.db_type ? escapeHtml(cfg.db_type) : 'General'}</strong>
+              ${isAdmin ? `<button type="button" class="btn btn-sm btn-outline-teal edit-config-btn" data-idx="${idx}"><i class="bi bi-pencil"></i> Edit</button>` : ''}
+            </div>
+            <div class="detail-row"><div class="detail-label">${rowIcon('Environment')}Environment</div><div class="detail-value"><span class="badge env-badge ${envBadgeClass(cfg.environment)}">${escapeHtml(cfg.environment)}</span></div></div>
+            ${copyableRow('Web URL', `webUrl_${idx}`, cfg.web_url)}
+            ${copyableRow('RF URL', `rfUrl_${idx}`, cfg.rf_url)}
+            ${passwordRow(cfg, idx)}
+            ${dbRows}
+            ${copyableRow('Log Path', `logPath_${idx}`, cfg.log_path)}
+            ${copyableRow('Daemon Path', `daemonPath_${idx}`, cfg.daemon_path)}
+            <div class="detail-row"><div class="detail-label">${rowIcon('Last Updated')}Last Updated</div><div class="detail-value text-muted">${cfg.updated_by ? escapeHtml(cfg.updated_by) + ' on ' + escapeHtml(cfg.updated_date) : '-'}</div></div>
+          </div>`;
+      }).join('');
+
+      configsContainer.querySelectorAll('.copy-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const targetEl = document.getElementById(btn.getAttribute('data-copy-target'));
+          const text = targetEl ? (targetEl.textContent || '').trim() : '';
+          if (!text || text === '-') return;
+          navigator.clipboard.writeText(text).then(() => {
+            const icon = btn.querySelector('i');
+            icon.className = 'bi bi-check2';
+            setTimeout(() => { icon.className = 'bi bi-clipboard'; }, 1200);
+          });
+        });
+      });
+
+      if (isAdmin) {
+        configsContainer.querySelectorAll('.edit-config-btn').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            const cfg = currentConfigs[Number(btn.getAttribute('data-idx'))];
+            fillForm(cfg);
+            if (cfg.has_password) {
+              const res = await fetch(`/api/instance-details/secret?instance_id=${encodeURIComponent(selectedInstanceId)}&environment=${encodeURIComponent(environmentSelect.value)}&db_type=${encodeURIComponent(cfg.db_type || '')}`);
+              const secret = await res.json();
+              document.getElementById('fDbPassword').value = secret.db_password || '';
+            }
+          });
+        });
+      }
+
+      configsContainer.querySelectorAll('.reveal-password-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const idx = Number(btn.getAttribute('data-idx'));
+          const cfg = currentConfigs[idx];
+          const span = document.getElementById(`password_${idx}`);
+          const icon = btn.querySelector('i');
+          if (icon.className.includes('eye-slash')) {
+            span.textContent = '••••••••';
+            icon.className = 'bi bi-eye';
+            return;
+          }
+          const res = await fetch(`/api/instance-details/secret?instance_id=${encodeURIComponent(selectedInstanceId)}&environment=${encodeURIComponent(environmentSelect.value)}&db_type=${encodeURIComponent(cfg.db_type || '')}`);
+          const secret = await res.json();
+          span.textContent = secret.db_password || '(unavailable)';
+          icon.className = 'bi bi-eye-slash';
+        });
+      });
+    }
+
+    function envBadgeClass(environment) {
+      var key = String(environment || '').trim().toUpperCase();
+      if (key === 'PROD') return 'env-prod';
+      if (key === 'UAT') return 'env-uat';
+      if (key === 'QA') return 'env-qa';
+      if (key === 'DEV') return 'env-dev';
+      if (key === 'STAGE') return 'env-stage';
+      return 'env-default';
+    }
+
+    async function loadConfigs() {
+      noInstanceSelected.style.display = 'none';
+      instancePanels.style.display = '';
+      instanceEnvBadge.textContent = `${selectedInstanceId} / ${environmentSelect.value}`;
+      instanceEnvBadge.className = `badge env-badge ${envBadgeClass(environmentSelect.value)}`;
+      showMsg('', true);
+      fillForm(null);
+
+      const res = await fetch(`/api/instance-details/lookup?instance_id=${encodeURIComponent(selectedInstanceId)}&environment=${encodeURIComponent(environmentSelect.value)}`);
+      const data = await res.json();
+      if (data.success) {
+        renderConfigs(data.configs);
+      } else {
+        showMsg(data.message || 'Failed to load configuration.', false);
+      }
+    }
+
+    if (instanceForm) {
+      instanceForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        if (!selectedInstanceId || !environmentSelect.value) {
+          showMsg('Select an Instance ID and Environment first.', false);
+          return;
+        }
+        const dbType = fDbType.value;
+        const existing = currentConfigs.find(c => (c.db_type || '') === dbType);
+        if (existing) {
+          const label = `${selectedInstanceId} / ${environmentSelect.value}` + (dbType ? ` / ${dbType}` : '');
+          if (!confirm(`A configuration already exists for ${label}. Update it?`)) return;
+        }
+
+        const payload = {
+          instance_id: selectedInstanceId,
+          environment: environmentSelect.value,
+          db_type: dbType,
+          web_url: document.getElementById('fWebUrl').value,
+          rf_url: document.getElementById('fRfUrl').value,
+          db_username: document.getElementById('fDbUsername').value,
+          db_password: document.getElementById('fDbPassword').value,
+          db_host: document.getElementById('fDbHost').value,
+          db_port: document.getElementById('fDbPort').value,
+          db_sid: document.getElementById('fDbSid').value,
+          db_name: document.getElementById('fDbName').value,
+          db_server_name: document.getElementById('fDbServerName').value,
+          log_path: document.getElementById('fLogPath').value,
+          daemon_path: document.getElementById('fDaemonPath').value,
+        };
+        const res = await fetch('/api/instance-details/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (data.success) {
+          showMsg(data.message, true);
+          loadConfigs();
+        } else {
+          showMsg(data.message || 'Save failed.', false);
+        }
+      });
+    }
+
+    if (btnDeleteInstance) {
+      btnDeleteInstance.addEventListener('click', async () => {
+        if (!selectedInstanceId || !environmentSelect.value) {
+          showMsg('Select an Instance ID and Environment first.', false);
+          return;
+        }
+        const dbType = fDbType.value;
+        const label = `${selectedInstanceId} / ${environmentSelect.value}` + (dbType ? ` / ${dbType}` : '');
+        if (!confirm(`Delete configuration for ${label}?`)) return;
+        const res = await fetch(`/api/instance-details/delete?instance_id=${encodeURIComponent(selectedInstanceId)}&environment=${encodeURIComponent(environmentSelect.value)}&db_type=${encodeURIComponent(dbType)}`, { method: 'DELETE' });
+        const data = await res.json();
+        if (data.success) {
+          showMsg('Deleted.', true);
+          fillForm(null);
+          loadConfigs();
+        } else {
+          showMsg(data.message || 'Delete failed.', false);
+        }
+      });
+    }
+
+    loadInstanceIds();
+  </script>
+</body>
+</html>

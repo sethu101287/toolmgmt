@@ -1,0 +1,877 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Task Management</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet" />
+  <link href="{{ url_for('static', filename='css/theme.css') }}" rel="stylesheet" />
+  <style>
+    body { background: #F5F8FC; font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif; }
+    body.embedded { background: #fff; }
+    .card-soft { border: 1px solid #DCE6F2; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,.08); }
+    .kpi-card {
+      border-radius: 6px;
+      padding: 4px 10px;
+      color: #fff;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      line-height: 1.5;
+      white-space: nowrap;
+    }
+    .kpi-card[role="button"] { cursor: pointer; transition: filter .15s ease; }
+    .kpi-card[role="button"]:hover { filter: brightness(1.15); }
+    .kpi-card .kpi-value { font-size: .85rem; font-weight: 700; }
+    .kpi-card .kpi-label { font-size: .78rem; opacity: .9; }
+    .kpi-total { background: linear-gradient(135deg, #2563EB, #06B6D4); }
+    .kpi-pending { background: linear-gradient(135deg, #F59E0B, #fbbf24); }
+    .kpi-completed { background: linear-gradient(135deg, #10B981, #34d399); }
+    .kpi-assigned { background: linear-gradient(135deg, #2563EB, #3b82f6); }
+    .kpi-unassigned { background: linear-gradient(135deg, #64748B, #94a3b8); }
+    .kpi-high { background: linear-gradient(135deg, #EF4444, #f87171); }
+    .kpi-overdue { background: linear-gradient(135deg, #EF4444, #dc2626); }
+
+    .badge-priority-high { background: #dc3545; }
+    .badge-priority-medium { background: #ffc107; color: #222; }
+    .badge-priority-low { background: #198754; }
+    .badge-status-completed { background: #6c757d; }
+    .badge-status-pending { background: #0dcaf0; color: #222; }
+    .badge-status-inprogress { background: #6610f2; }
+
+    .task-table-wrap { max-height: 68vh; overflow-y: auto; }
+    .completed-table-wrap { max-height: 32vh; overflow-y: auto; }
+    #pendingTable { font-size: .8rem; }
+    #pendingTable th, #pendingTable td { padding: .35rem .5rem; }
+    .task-table-wrap thead th,
+    .completed-table-wrap thead th {
+      position: sticky;
+      top: 0;
+      z-index: 3;
+      background: #fff;
+      box-shadow: 0 1px 0 #dee2e6;
+    }
+    table.task-table tbody tr { cursor: pointer; transition: background-color .15s ease; }
+    table.task-table tbody tr.selected-row,
+    table.task-table tbody tr.selected-row > td,
+    table.task-table tbody tr.selected-row:hover > td {
+      background-color: #DCFCE7 !important;
+      box-shadow: inset 0 0 0 2px #10B981;
+      animation: taskSelectPulse .3s ease;
+    }
+    @keyframes taskSelectPulse {
+      0% { box-shadow: inset 0 0 0 0 rgba(16,185,129,.6); }
+      100% { box-shadow: inset 0 0 0 2px #10B981; }
+    }
+    table.task-table tbody tr.row-overdue td { color: #EF4444; font-weight: 600; }
+    table.task-table tbody tr.row-overdue td:first-child { border-left: 3px solid #EF4444; }
+    table.task-table tbody tr.row-completed { background: #ECFDF5; color: #10B981; }
+    .toolbar-btn[disabled] { opacity: .5; }
+    .card-body.flex-nowrap > * { flex-shrink: 0; }
+    .priority-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+    .dot-high { background: #dc3545; }
+    .dot-medium { background: #ffc107; }
+    .dot-low { background: #198754; }
+    #searchBox { width: 100%; }
+    .toolbar-sticky {
+      position: sticky;
+      top: 12px;
+      z-index: 20;
+      background: #F5F8FC;
+    }
+    .task-shell { align-items: flex-start; }
+    .task-toolbar-col { flex: 0 0 190px; max-width: 190px; }
+    .task-toolbar-col .btn { justify-content: flex-start; }
+    .task-main-col { flex: 1 1 auto; min-width: 0; }
+    @media (max-width: 767px) {
+      .task-shell { flex-direction: column; }
+      .task-toolbar-col { flex: 1 1 auto; max-width: none; width: 100%; }
+    }
+    body.embedded .toolbar-sticky { background: #fff; }
+
+    a { text-decoration: none; color: #464feb; }
+    tr th, tr td { border: 1px solid #e6e6e6; }
+    tr th { background-color: #f5f5f5; }
+  </style>
+</head>
+<body class="{{ 'embedded' if embedded else '' }}">
+  <div class="container-fluid py-3 px-3">
+    <div class="d-flex gap-3 task-shell">
+
+    <!-- Toolbar (vertical, left side) -->
+    <div class="card card-soft toolbar-sticky task-toolbar-col">
+      <div class="card-body d-flex flex-column gap-2">
+        <button class="btn btn-success btn-sm w-100" data-bs-toggle="modal" data-bs-target="#addTaskModal">
+          <i class="bi bi-plus-circle me-1"></i>Add Task
+        </button>
+        <button class="btn btn-warning btn-sm w-100 toolbar-btn" id="btnEditTask" disabled>
+          <i class="bi bi-pencil-square me-1"></i>Edit Task
+        </button>
+        <button class="btn btn-danger btn-sm w-100 toolbar-btn" id="btnDeleteTask" disabled>
+          <i class="bi bi-trash3 me-1"></i>Delete Task
+        </button>
+        <button class="btn btn-primary btn-sm w-100 toolbar-btn" id="btnAssignTask" disabled data-bs-toggle="modal" data-bs-target="#assignTaskModal">
+          <i class="bi bi-person-plus me-1"></i>Assign Task
+        </button>
+        <button class="btn btn-outline-success btn-sm w-100 toolbar-btn" id="btnMarkComplete" disabled>
+          <i class="bi bi-check2-circle me-1"></i>Mark Complete
+        </button>
+        <button class="btn btn-outline-primary btn-sm w-100 toolbar-btn" id="btnAddComment" disabled data-bs-toggle="modal" data-bs-target="#addCommentModal">
+          <i class="bi bi-chat-left-text me-1"></i>Add Comment
+        </button>
+        <button class="btn btn-outline-primary btn-sm w-100" id="btnRefreshDashboard">
+          <i class="bi bi-arrow-clockwise me-1"></i>Refresh Dashboard
+        </button>
+        <button class="btn btn-outline-secondary btn-sm w-100" id="btnShowAll">Show All Tasks</button>
+
+        <hr class="my-1">
+
+        <button class="btn btn-outline-primary btn-sm w-100" id="searchToggleBtn" title="Search">
+          <i class="bi bi-search me-1"></i>Search
+        </button>
+        <div class="input-group input-group-sm" id="searchBox" style="display:none;">
+          <input type="text" id="searchInput" class="form-control" placeholder="Task ID, name, assignee, comment...">
+          <button class="btn btn-primary" id="btnSearch"><i class="bi bi-search"></i></button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main content (right side, gets the freed-up horizontal space) -->
+    <div class="task-main-col">
+
+    <!-- Pending Tasks Grid (full width, VC-Shift-style header, past+today consolidated) -->
+    <div class="card card-soft">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+          <h5 class="mb-0"><i class="bi bi-hourglass-split me-2 text-warning icon-pulse"></i>Pending Tasks
+            <span class="badge bg-secondary ms-1" id="pendingCount">0</span>
+          </h5>
+          <div class="d-flex align-items-center gap-2">
+            <button type="button" class="btn btn-sm btn-outline-primary" id="taskDatePrev" title="Previous day">
+              <i class="bi bi-chevron-left"></i>
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="taskDateToday" title="Jump to today">Today</button>
+            <button type="button" class="btn btn-sm btn-outline-primary" id="taskDateNext" title="Next day">
+              <i class="bi bi-chevron-right"></i>
+            </button>
+          </div>
+        </div>
+
+        <div class="mb-3 d-flex align-items-center gap-2 flex-wrap">
+          <span class="badge bg-primary" id="taskDateBadge">18-Sep-2026</span>
+          <span class="badge bg-secondary" id="taskDayBadge">Fri</span>
+          <span class="badge" id="taskViewBadge" style="background:#6f42c1;">Today's Pending Tasks</span>
+          <button type="button" class="btn btn-sm btn-outline-danger d-none" id="btnClearFilter">
+            <i class="bi bi-x-circle me-1"></i>Clear Filter
+          </button>
+        </div>
+
+        <div class="table-responsive task-table-wrap">
+          <table class="table table-hover table-sm task-table" id="pendingTable">
+            <thead>
+              <tr>
+                <th><input type="checkbox" id="selectAllPending" title="Select all"></th>
+                <th>ID#</th>
+                <th>Task</th>
+                <th>Assigned To</th>
+                <th>Due Date</th>
+                <th>Comments</th>
+                <th>Alarm</th>
+              </tr>
+            </thead>
+            <tbody id="pendingTableBody">
+              <tr><td colspan="7" class="text-center text-muted py-3">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Future Date Tasks (only dates that actually have upcoming tasks) -->
+    <div class="d-flex flex-wrap gap-2 my-3" id="futureTasksRow"></div>
+
+    <!-- Bottom Section: Completed Tasks Grid -->
+    <div class="card card-soft" id="completedSection">
+      <div class="card-body">
+        <div class="fw-semibold d-flex justify-content-between align-items-center mb-2">
+          <span><i class="bi bi-check2-circle me-1 text-success icon-float"></i>Completed Tasks
+            <span class="badge bg-secondary ms-1" id="completedCount">0</span>
+          </span>
+          <span class="badge bg-primary" id="completedDateBadge">18-Sep-2026</span>
+        </div>
+        <div class="table-responsive completed-table-wrap">
+          <table class="table table-hover table-sm task-table" id="completedTable">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Task</th>
+                <th>Priority</th>
+                <th>Assigned To</th>
+                <th>Due Date</th>
+                <th>Completed At</th>
+              </tr>
+            </thead>
+            <tbody id="completedTableBody">
+              <tr><td colspan="6" class="text-center text-muted py-3">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    </div>
+    </div>
+  </div>
+
+  <!-- Add Task Modal -->
+  <div class="modal fade" id="addTaskModal" tabindex="-1">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Add Task</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <div class="mb-2">
+            <label class="form-label">Task Name</label>
+            <input type="text" class="form-control" id="addTaskName">
+          </div>
+          <input type="hidden" id="addTaskDescription">
+          <div class="row">
+            <div class="col-6 mb-2">
+              <label class="form-label">Priority</label>
+              <select class="form-select" id="addTaskPriority">
+                <option>High</option>
+                <option selected>Medium</option>
+                <option>Low</option>
+              </select>
+            </div>
+            <div class="col-6 mb-2">
+              <label class="form-label">Due Date</label>
+              <input type="date" class="form-control" id="addTaskDueDate">
+            </div>
+          </div>
+          <div class="mb-2 form-check">
+            <input class="form-check-input" type="checkbox" id="addTaskAlarmEnabled">
+            <label class="form-check-label" for="addTaskAlarmEnabled">Set Alarm (India Time)</label>
+          </div>
+          <div class="mb-2" id="addTaskAlarmTimeWrap" style="display:none;">
+            <label class="form-label">Alarm Time (IST)</label>
+            <input type="time" class="form-control" id="addTaskAlarmTime">
+            <div class="form-text">You will be reminded 15 minutes before and at this time.</div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button class="btn btn-success" id="btnSaveAddTask">Save Task</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Edit Task Modal -->
+  <div class="modal fade" id="editTaskModal" tabindex="-1">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Edit Task</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <div class="mb-2">
+            <label class="form-label">Task Name</label>
+            <input type="text" class="form-control" id="editTaskName">
+          </div>
+          <div class="mb-2">
+            <label class="form-label">Description</label>
+            <textarea class="form-control" id="editTaskDescription" rows="3"></textarea>
+          </div>
+          <div class="row">
+            <div class="col-6 mb-2">
+              <label class="form-label">Priority</label>
+              <select class="form-select" id="editTaskPriority">
+                <option>High</option>
+                <option>Medium</option>
+                <option>Low</option>
+              </select>
+            </div>
+            <div class="col-6 mb-2">
+              <label class="form-label">Due Date</label>
+              <input type="date" class="form-control" id="editTaskDueDate">
+            </div>
+          </div>
+          <div class="mb-2 form-check">
+            <input class="form-check-input" type="checkbox" id="editTaskAlarmEnabled">
+            <label class="form-check-label" for="editTaskAlarmEnabled">Set Alarm (India Time)</label>
+          </div>
+          <div class="mb-2" id="editTaskAlarmTimeWrap" style="display:none;">
+            <label class="form-label">Alarm Time (IST)</label>
+            <input type="time" class="form-control" id="editTaskAlarmTime">
+            <div class="form-text">You will be reminded 15 minutes before and at this time.</div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button class="btn btn-warning" id="btnSaveEditTask">Save Changes</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Assign Task Modal -->
+  <div class="modal fade" id="assignTaskModal" tabindex="-1">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Assign Task</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <label class="form-label">Assigned Person Name</label>
+          <input type="text" class="form-control" id="assignPersonName" list="employeeDatalist">
+          <datalist id="employeeDatalist"></datalist>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button class="btn btn-primary" id="btnSaveAssignTask">Assign</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add Comment Modal -->
+  <div class="modal fade" id="addCommentModal" tabindex="-1">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Add Comment</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <textarea class="form-control" id="newCommentText" rows="3" placeholder="Write a comment..."></textarea>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button class="btn btn-primary" id="btnSaveComment">Post Comment</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete Confirm Modal -->
+  <div class="modal fade" id="deleteTaskModal" tabindex="-1">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Delete Task</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">Are you sure you want to delete this task?</div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button class="btn btn-danger" id="btnConfirmDeleteTask">Delete</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <div id="alarmToastContainer" class="toast-container position-fixed bottom-0 end-0 p-3" style="z-index: 1080;"></div>
+  <script>
+    let selectedTaskId = null;
+    let selectedTaskStatus = null;
+    let pendingFilters = {};
+    let latestPendingTasks = [];
+    const firedReminders = new Set();
+    const checkedTaskIds = new Set();
+
+    function showInfoToast(message, iconClass = 'bi-info-circle-fill') {
+      const container = document.getElementById('alarmToastContainer');
+      const toastEl = document.createElement('div');
+      toastEl.className = 'toast align-items-center text-bg-primary border-0';
+      toastEl.setAttribute('role', 'alert');
+      toastEl.innerHTML = `
+        <div class="d-flex">
+          <div class="toast-body"><i class="bi ${iconClass} me-1"></i>${escapeHtml(message)}</div>
+          <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
+        </div>`;
+      container.appendChild(toastEl);
+      const toast = new bootstrap.Toast(toastEl, { delay: 4000 });
+      toast.show();
+      toastEl.addEventListener('hidden.bs.toast', () => toastEl.remove());
+    }
+
+    function priorityBadge(priority) {
+      const cls = priority === 'High' ? 'badge-priority-high' : priority === 'Low' ? 'badge-priority-low' : 'badge-priority-medium';
+      return `<span class="badge ${cls}">${priority}</span>`;
+    }
+
+    function priorityDot(priority) {
+      const cls = priority === 'High' ? 'dot-high' : priority === 'Low' ? 'dot-low' : 'dot-medium';
+      return `<span class="priority-dot ${cls}" title="${priority} priority"></span>`;
+    }
+
+    function alarmIcon(t) {
+      if (t.alarm_enabled && t.alarm_time) {
+        return `<i class="bi bi-alarm-fill text-danger" title="Alarm at ${t.alarm_time} IST"></i>`;
+      }
+      return `<i class="bi bi-alarm text-muted" title="No alarm set"></i>`;
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text == null ? '' : String(text);
+      return div.innerHTML;
+    }
+
+    async function apiFetch(url, options) {
+      const resp = await fetch(url, options);
+      let data = {};
+      try { data = await resp.json(); } catch (e) { data = {}; }
+      if (!resp.ok) {
+        throw new Error(data.error || 'Request failed.');
+      }
+      return data;
+    }
+
+    function setToolbarState() {
+      const hasSelection = !!selectedTaskId;
+      const hasChecked = checkedTaskIds.size > 0;
+      document.getElementById('btnEditTask').disabled = !hasSelection || hasChecked;
+      document.getElementById('btnDeleteTask').disabled = !hasSelection || hasChecked;
+      document.getElementById('btnAssignTask').disabled = !hasSelection || hasChecked;
+      document.getElementById('btnAddComment').disabled = !hasSelection || hasChecked;
+      document.getElementById('btnMarkComplete').disabled = hasChecked ? false : (!hasSelection || selectedTaskStatus === 'Completed');
+    }
+
+    function daysFromToday(dateStr) {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const target = new Date(dateStr + 'T00:00:00');
+      return Math.round((target - today) / 86400000);
+    }
+
+    async function loadFutureTaskSummary() {
+      const data = await apiFetch('/api/tasks/future-summary');
+      const row = document.getElementById('futureTasksRow');
+      const future = data.future || [];
+      if (!future.length) {
+        row.innerHTML = '';
+        return;
+      }
+      row.innerHTML = future.map((f) => `
+        <div class="kpi-card kpi-total" role="button" data-due-date="${f.due_date}" title="Show pending tasks for ${escapeHtml(f.due_date)}">
+          <div class="kpi-value">${f.count}</div><div class="kpi-label">${formatDateBadge(f.due_date)}</div>
+        </div>
+      `).join('');
+      row.querySelectorAll('[data-due-date]').forEach((card) => {
+        card.addEventListener('click', () => {
+          taskDateOffset = daysFromToday(card.dataset.dueDate);
+          loadPendingByDate();
+          loadCompleted();
+        });
+      });
+    }
+
+    async function loadEmployees() {
+      const data = await apiFetch('/api/tasks/employees');
+      const datalist = document.getElementById('employeeDatalist');
+      datalist.innerHTML = '';
+      (data.employees || []).forEach((name) => {
+        const dlOpt = document.createElement('option');
+        dlOpt.value = name;
+        datalist.appendChild(dlOpt);
+      });
+    }
+
+    function renderPendingRows(tasks) {
+      const body = document.getElementById('pendingTableBody');
+      document.getElementById('pendingCount').textContent = tasks.length;
+      checkedTaskIds.clear();
+      document.getElementById('selectAllPending').checked = false;
+      if (!tasks.length) {
+        body.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-3">No tasks found.</td></tr>';
+        setToolbarState();
+        return;
+      }
+      body.innerHTML = tasks.map((t, idx) => `
+        <tr data-id="${t.id}" data-status="${t.status}" class="${t.status === 'Completed' ? 'row-completed' : (t.is_overdue ? 'row-overdue' : '')} ${selectedTaskId === t.id ? 'selected-row' : ''}">
+          <td><input type="checkbox" class="task-select-checkbox" data-id="${t.id}" ${t.status === 'Completed' ? 'disabled' : ''}></td>
+          <td>#${idx + 1}</td>
+          <td>${priorityDot(t.priority)}${escapeHtml(t.task_name)}</td>
+          <td>${t.assigned_to ? escapeHtml(t.assigned_to) : '<span class="text-muted">Unassigned</span>'}</td>
+          <td>${t.due_date || '-'}</td>
+          <td>${t.latest_comment ? escapeHtml(t.latest_comment) : '-'}</td>
+          <td>${alarmIcon(t)}</td>
+        </tr>
+      `).join('');
+
+      body.querySelectorAll('tr[data-id]').forEach((row) => {
+        row.addEventListener('click', (e) => {
+          if (e.target.classList.contains('task-select-checkbox')) return;
+          selectTask(parseInt(row.dataset.id, 10), row.dataset.status);
+        });
+      });
+      body.querySelectorAll('.task-select-checkbox').forEach((cb) => {
+        cb.addEventListener('change', () => {
+          const id = parseInt(cb.dataset.id, 10);
+          if (cb.checked) checkedTaskIds.add(id); else checkedTaskIds.delete(id);
+          setToolbarState();
+        });
+      });
+      setToolbarState();
+    }
+
+    function renderCompletedRows(tasks) {
+      const body = document.getElementById('completedTableBody');
+      document.getElementById('completedCount').textContent = tasks.length;
+      if (!tasks.length) {
+        body.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-3">No completed tasks yet.</td></tr>';
+        return;
+      }
+      body.innerHTML = tasks.map((t, idx) => `
+        <tr data-id="${t.id}" data-status="${t.status}" class="row-completed ${selectedTaskId === t.id ? 'selected-row' : ''}">
+          <td>#${idx + 1}</td>
+          <td>${escapeHtml(t.task_name)}</td>
+          <td>${priorityBadge(t.priority)}</td>
+          <td>${t.assigned_to ? escapeHtml(t.assigned_to) : '-'}</td>
+          <td>${t.due_date || '-'}</td>
+          <td>${t.completed_at || '-'}</td>
+        </tr>
+      `).join('');
+
+      body.querySelectorAll('tr[data-id]').forEach((row) => {
+        row.addEventListener('click', () => selectTask(parseInt(row.dataset.id, 10), row.dataset.status));
+      });
+    }
+
+    let taskDateOffset = 0;
+
+    function computeSelectedDate() {
+      const d = new Date();
+      d.setDate(d.getDate() + taskDateOffset);
+      return d.toISOString().slice(0, 10);
+    }
+
+    function formatDateBadge(dateStr) {
+      const d = new Date(dateStr + 'T00:00:00');
+      return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
+    }
+
+    function formatDayBadge(dateStr) {
+      const d = new Date(dateStr + 'T00:00:00');
+      return d.toLocaleDateString('en-US', { weekday: 'short' });
+    }
+
+    const VIEW_LABELS = {
+      past: 'Past Pending Tasks',
+      today: "Today's Pending Tasks",
+      future: 'Future Date View',
+    };
+    const VIEW_COLORS = {
+      past: '#b91c1c',
+      today: '#c2410c',
+      future: '#2563eb',
+    };
+
+    async function loadPendingByDate() {
+      const dateStr = computeSelectedDate();
+      document.getElementById('taskDateBadge').textContent = formatDateBadge(dateStr);
+      document.getElementById('taskDayBadge').textContent = formatDayBadge(dateStr);
+      const params = new URLSearchParams({ date: dateStr, ...pendingFilters });
+      const data = await apiFetch('/api/tasks/pending-by-date?' + params.toString());
+      const viewBadge = document.getElementById('taskViewBadge');
+      viewBadge.textContent = VIEW_LABELS[data.view] || 'Pending Tasks';
+      viewBadge.style.background = VIEW_COLORS[data.view] || '#6f42c1';
+      renderPendingRows(data.tasks || []);
+    }
+
+    async function loadAlarmTasks() {
+      const data = await apiFetch('/api/tasks?scope=pending');
+      latestPendingTasks = data.tasks || [];
+    }
+
+    async function loadCompleted() {
+      const dateStr = computeSelectedDate();
+      document.getElementById('completedDateBadge').textContent = formatDateBadge(dateStr);
+      const data = await apiFetch('/api/tasks?' + new URLSearchParams({ scope: 'completed', date: dateStr }).toString());
+      renderCompletedRows(data.tasks || []);
+    }
+
+    document.getElementById('taskDatePrev').addEventListener('click', () => {
+      taskDateOffset -= 1;
+      loadPendingByDate();
+      loadCompleted();
+    });
+    document.getElementById('taskDateNext').addEventListener('click', () => {
+      taskDateOffset += 1;
+      loadPendingByDate();
+      loadCompleted();
+    });
+    document.getElementById('taskDateToday').addEventListener('click', () => {
+      if (taskDateOffset === 0) return;
+      taskDateOffset = 0;
+      loadPendingByDate();
+      loadCompleted();
+    });
+
+    function selectTask(taskId, status) {
+      selectedTaskId = taskId;
+      selectedTaskStatus = status;
+      setToolbarState();
+
+      document.querySelectorAll('#pendingTableBody tr, #completedTableBody tr').forEach((row) => {
+        row.classList.toggle('selected-row', row.dataset.id == String(taskId));
+      });
+    }
+
+    async function refreshAll() {
+      await Promise.all([loadFutureTaskSummary(), loadEmployees(), loadPendingByDate(), loadAlarmTasks(), loadCompleted()]);
+    }
+
+    document.getElementById('btnSearch').addEventListener('click', () => {
+      const q = document.getElementById('searchInput').value.trim();
+      pendingFilters = q ? { q } : {};
+      document.getElementById('btnClearFilter').classList.toggle('d-none', !q);
+      loadPendingByDate();
+      if (q) showInfoToast(`Filter applied: "${q}"`, 'bi-funnel-fill');
+    });
+    document.getElementById('searchInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') document.getElementById('btnSearch').click();
+    });
+    document.getElementById('searchToggleBtn').addEventListener('click', () => {
+      const box = document.getElementById('searchBox');
+      const expanded = box.style.display !== 'none';
+      box.style.display = expanded ? 'none' : 'flex';
+      if (!expanded) document.getElementById('searchInput').focus();
+    });
+    document.getElementById('btnClearFilter').addEventListener('click', () => {
+      pendingFilters = {};
+      document.getElementById('searchInput').value = '';
+      document.getElementById('btnClearFilter').classList.add('d-none');
+      loadPendingByDate();
+      showInfoToast('Filter cleared.', 'bi-x-circle-fill');
+    });
+    document.getElementById('selectAllPending').addEventListener('change', (e) => {
+      const checked = e.target.checked;
+      document.querySelectorAll('.task-select-checkbox:not(:disabled)').forEach((cb) => {
+        cb.checked = checked;
+        const id = parseInt(cb.dataset.id, 10);
+        if (checked) checkedTaskIds.add(id); else checkedTaskIds.delete(id);
+      });
+      setToolbarState();
+    });
+    document.getElementById('btnShowAll').addEventListener('click', () => {
+      pendingFilters = {};
+      document.getElementById('searchInput').value = '';
+      document.getElementById('btnClearFilter').classList.add('d-none');
+      loadPendingByDate();
+    });
+    document.getElementById('btnRefreshDashboard').addEventListener('click', refreshAll);
+
+    document.getElementById('addTaskAlarmEnabled').addEventListener('change', (e) => {
+      document.getElementById('addTaskAlarmTimeWrap').style.display = e.target.checked ? 'block' : 'none';
+    });
+    document.getElementById('editTaskAlarmEnabled').addEventListener('change', (e) => {
+      document.getElementById('editTaskAlarmTimeWrap').style.display = e.target.checked ? 'block' : 'none';
+    });
+
+    document.getElementById('addTaskModal').addEventListener('show.bs.modal', () => {
+      document.getElementById('addTaskName').value = '';
+      document.getElementById('addTaskDescription').value = '';
+      document.getElementById('addTaskPriority').value = 'Medium';
+      document.getElementById('addTaskDueDate').value = new Date().toISOString().slice(0, 10);
+      document.getElementById('addTaskAlarmEnabled').checked = false;
+      document.getElementById('addTaskAlarmTime').value = '';
+      document.getElementById('addTaskAlarmTimeWrap').style.display = 'none';
+    });
+
+    document.getElementById('btnSaveAddTask').addEventListener('click', async () => {
+      const task_name = document.getElementById('addTaskName').value.trim();
+      if (!task_name) { alert('Task Name is required.'); return; }
+      const alarm_enabled = document.getElementById('addTaskAlarmEnabled').checked;
+      if (alarm_enabled && !document.getElementById('addTaskAlarmTime').value) {
+        alert('Please provide an Alarm Time (IST).'); return;
+      }
+      await apiFetch('/api/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          task_name,
+          description: document.getElementById('addTaskDescription').value.trim(),
+          priority: document.getElementById('addTaskPriority').value,
+          due_date: document.getElementById('addTaskDueDate').value,
+          alarm_enabled,
+          alarm_time: document.getElementById('addTaskAlarmTime').value,
+        }),
+      });
+      bootstrap.Modal.getInstance(document.getElementById('addTaskModal')).hide();
+      await Promise.all([loadPendingByDate(), loadAlarmTasks(), loadFutureTaskSummary()]);
+    });
+
+    document.getElementById('btnEditTask').addEventListener('click', async () => {
+      if (!selectedTaskId) return;
+      const data = await apiFetch('/api/tasks/' + selectedTaskId);
+      const t = data.task;
+      document.getElementById('editTaskName').value = t.task_name;
+      document.getElementById('editTaskDescription').value = t.description || '';
+      document.getElementById('editTaskPriority').value = t.priority;
+      document.getElementById('editTaskDueDate').value = t.due_date || '';
+      document.getElementById('editTaskAlarmEnabled').checked = !!t.alarm_enabled;
+      document.getElementById('editTaskAlarmTime').value = t.alarm_time || '';
+      document.getElementById('editTaskAlarmTimeWrap').style.display = t.alarm_enabled ? 'block' : 'none';
+      new bootstrap.Modal(document.getElementById('editTaskModal')).show();
+    });
+
+    document.getElementById('btnSaveEditTask').addEventListener('click', async () => {
+      if (!selectedTaskId) return;
+      const alarm_enabled = document.getElementById('editTaskAlarmEnabled').checked;
+      if (alarm_enabled && !document.getElementById('editTaskAlarmTime').value) {
+        alert('Please provide an Alarm Time (IST).'); return;
+      }
+      await apiFetch('/api/tasks/' + selectedTaskId, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          task_name: document.getElementById('editTaskName').value.trim(),
+          description: document.getElementById('editTaskDescription').value.trim(),
+          priority: document.getElementById('editTaskPriority').value,
+          due_date: document.getElementById('editTaskDueDate').value,
+          alarm_enabled,
+          alarm_time: document.getElementById('editTaskAlarmTime').value,
+        }),
+      });
+      bootstrap.Modal.getInstance(document.getElementById('editTaskModal')).hide();
+      await Promise.all([loadPendingByDate(), loadAlarmTasks(), loadCompleted()]);
+      selectTask(selectedTaskId, selectedTaskStatus);
+    });
+
+    document.getElementById('btnDeleteTask').addEventListener('click', () => {
+      if (!selectedTaskId) return;
+      new bootstrap.Modal(document.getElementById('deleteTaskModal')).show();
+    });
+
+    document.getElementById('btnConfirmDeleteTask').addEventListener('click', async () => {
+      if (!selectedTaskId) return;
+      await apiFetch('/api/tasks/' + selectedTaskId, { method: 'DELETE' });
+      bootstrap.Modal.getInstance(document.getElementById('deleteTaskModal')).hide();
+      selectedTaskId = null;
+      selectedTaskStatus = null;
+      setToolbarState();
+      await refreshAll();
+    });
+
+    document.getElementById('btnSaveAssignTask').addEventListener('click', async () => {
+      if (!selectedTaskId) return;
+      const assigned_to = document.getElementById('assignPersonName').value.trim();
+      if (!assigned_to) { alert('Assigned Person Name is required.'); return; }
+      await apiFetch(`/api/tasks/${selectedTaskId}/assign`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ assigned_to }),
+      });
+      bootstrap.Modal.getInstance(document.getElementById('assignTaskModal')).hide();
+      document.getElementById('assignPersonName').value = '';
+      await Promise.all([loadPendingByDate(), loadAlarmTasks(), loadFutureTaskSummary(), loadEmployees()]);
+      selectTask(selectedTaskId, selectedTaskStatus);
+    });
+
+    document.getElementById('btnMarkComplete').addEventListener('click', async () => {
+      if (checkedTaskIds.size > 0) {
+        const taskIds = Array.from(checkedTaskIds);
+        await apiFetch('/api/tasks/complete-bulk', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ task_ids: taskIds }),
+        });
+        checkedTaskIds.clear();
+        selectedTaskId = null;
+        selectedTaskStatus = null;
+        await Promise.all([loadPendingByDate(), loadCompleted(), loadFutureTaskSummary()]);
+        setToolbarState();
+        return;
+      }
+      if (!selectedTaskId) return;
+      const taskId = selectedTaskId;
+      await apiFetch(`/api/tasks/${taskId}/complete`, { method: 'POST' });
+      await Promise.all([loadPendingByDate(), loadCompleted(), loadFutureTaskSummary()]);
+      selectTask(taskId, 'Completed');
+    });
+
+    document.getElementById('btnSaveComment').addEventListener('click', async () => {
+      if (!selectedTaskId) return;
+      const comment = document.getElementById('newCommentText').value.trim();
+      if (!comment) { alert('Comment text is required.'); return; }
+      await apiFetch(`/api/tasks/${selectedTaskId}/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ comment }),
+      });
+      bootstrap.Modal.getInstance(document.getElementById('addCommentModal')).hide();
+      document.getElementById('newCommentText').value = '';
+      await loadPendingByDate();
+      selectTask(selectedTaskId, selectedTaskStatus);
+    });
+
+    refreshAll();
+
+    function getIstTimeHHMM() {
+      const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false,
+      }).formatToParts(new Date());
+      const hh = parts.find((p) => p.type === 'hour').value;
+      const mm = parts.find((p) => p.type === 'minute').value;
+      return `${hh}:${mm}`;
+    }
+
+    function subtractMinutes(hhmm, minutes) {
+      const [h, m] = hhmm.split(':').map(Number);
+      const total = ((h * 60 + m - minutes) + 24 * 60) % (24 * 60);
+      return String(Math.floor(total / 60)).padStart(2, '0') + ':' + String(total % 60).padStart(2, '0');
+    }
+
+    function playAlarmSound() {
+      const audio = new Audio('/tasks/alarm-sound');
+      audio.play().catch(() => {});
+    }
+
+    function showAlarmToast(task, when) {
+      playAlarmSound();
+      const container = document.getElementById('alarmToastContainer');
+      const toastEl = document.createElement('div');
+      toastEl.className = 'toast align-items-center text-bg-warning border-0';
+      toastEl.setAttribute('role', 'alert');
+      toastEl.innerHTML = `
+        <div class="d-flex">
+          <div class="toast-body">
+            <i class="bi bi-alarm-fill me-1"></i>Reminder (${when}): Task #${task.id} "${escapeHtml(task.task_name)}" — alarm at ${task.alarm_time} IST
+          </div>
+          <button type="button" class="btn-close me-2 m-auto" data-bs-dismiss="toast"></button>
+        </div>`;
+      container.appendChild(toastEl);
+      const toast = new bootstrap.Toast(toastEl, { delay: 20000 });
+      toast.show();
+      toastEl.addEventListener('hidden.bs.toast', () => toastEl.remove());
+    }
+
+    function checkAlarms() {
+      const nowIst = getIstTimeHHMM();
+      const dayKey = new Date().toDateString();
+      latestPendingTasks.forEach((t) => {
+        if (!t.alarm_enabled || !t.alarm_time) return;
+        const preTime = subtractMinutes(t.alarm_time, 15);
+        [['pre', preTime, '15 minutes before'], ['main', t.alarm_time, 'now']].forEach(([slot, time, label]) => {
+          const key = `${t.id}-${slot}-${dayKey}`;
+          if (time === nowIst && !firedReminders.has(key)) {
+            firedReminders.add(key);
+            showAlarmToast(t, label);
+          }
+        });
+      });
+    }
+
+    setInterval(checkAlarms, 30000);
+  </script>
+</body>
+</html>

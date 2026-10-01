@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TEST_DEPLOYMENT Report</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root {
+      --ink: #1E293B;
+      --teal: #2563EB;
+      --amber: #F59E0B;
+      --paper: #F5F8FC;
+      --mist: #E0F2FE;
+    }
+    body {
+      background: linear-gradient(160deg, #F5F8FC, var(--mist));
+      color: var(--ink);
+      min-height: 100vh;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      margin: 0;
+    }
+    body.embedded {
+      background: #ffffff;
+    }
+    .hero {
+      background: linear-gradient(120deg, #2563EB, #06B6D4);
+      color: white;
+      border-radius: 14px;
+      box-shadow: 0 12px 24px rgba(37, 99, 235, 0.22);
+    }
+    .hero.compact {
+      padding: 14px 18px !important;
+      margin-bottom: 12px !important;
+      border-radius: 10px;
+    }
+    .hero.compact .h3 {
+      font-size: 1.1rem;
+      margin-bottom: 0.2rem;
+    }
+    .card-soft {
+      background: #ffffff;
+      border: 1px solid #DCE6F2;
+      border-radius: 12px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+    }
+    .chart-wrap { min-height: 260px; position: relative; }
+    .table-wrap { max-height: 500px; overflow: auto; }
+    .compact-table {
+      width: 100%;
+    }
+    .compact-table thead th {
+      position: sticky;
+      top: 0;
+      background: #f7fbfd;
+      z-index: 1;
+      font-size: 0.78rem;
+      white-space: nowrap;
+    }
+    .compact-table td {
+      font-size: 0.78rem;
+      white-space: normal;
+      word-break: break-word;
+    }
+  </style>
+</head>
+<body class="{% if embedded %}embedded{% endif %}">
+  <div class="{% if embedded %}container-fluid px-2 py-2{% else %}container py-4 py-md-5{% endif %}">
+    {% if not embedded %}
+    <div class="d-flex justify-content-end align-items-center gap-2 mb-2">
+      <button id="resetStatusFilter" class="btn btn-outline-secondary btn-sm">Reset Filter</button>
+      <a href="{{ url_for('dashboard') }}" class="btn btn-outline-secondary btn-sm">Back</a>
+    </div>
+    {% endif %}
+
+    {% if error %}
+      <div class="alert alert-danger">{{ error }}</div>
+    {% else %}
+      <div class="row g-3">
+        <div class="col-12 col-lg-4">
+          <div class="card-soft p-3 h-100">
+            <h2 class="h6 mb-2">Rows by Status</h2>
+            <div class="text-muted small mb-2">Rows: {{ row_count }}</div>
+            <div class="chart-wrap"><canvas id="statusPie"></canvas></div>
+          </div>
+        </div>
+
+        <div class="col-12 col-lg-8">
+          <div class="card-soft p-3 h-100">
+            <h2 class="h6 mb-2">Filtered Status Group Tags</h2>
+            <div id="activeStatus" class="text-muted small mb-2">Filter: All</div>
+            <div class="table-wrap">
+              <table class="table table-sm table-hover align-middle mb-0 compact-table">
+                <colgroup>
+                  <col style="width: 14%;" />
+                  <col style="width: 15%;" />
+                  <col style="width: 14%;" />
+                  <col style="width: 19%;" />
+                  <col style="width: 12%;" />
+                  <col style="width: 26%;" />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th title="DATE">DATE</th>
+                    <th title="INSTANCE_ID">INSTANCE_ID</th>
+                    <th title="GROUP_ID">GROUP_ID</th>
+                    <th title="GROUPED_BY">GROUPED_BY</th>
+                    <th title="STATUS">STATUS</th>
+                    <th title="VERSION_TAKEN_BY">VERSION_TAKEN_BY</th>
+                  </tr>
+                </thead>
+                <tbody id="statusDetailBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    {% endif %}
+  </div>
+
+  <script>
+    const allRows = {{ rows | tojson }};
+    const statusLabels = {{ status_labels | tojson }};
+    const statusValues = {{ status_values | tojson }};
+
+    const detailBody = document.getElementById('statusDetailBody');
+    const activeStatus = document.getElementById('activeStatus');
+    const resetBtn = document.getElementById('resetStatusFilter');
+
+    function normalizeStatus(value) {
+      const status = String(value ?? '').trim();
+      return status || 'UNKNOWN';
+    }
+
+    function renderRows(rows, statusLabel) {
+      if (!detailBody) return;
+      detailBody.innerHTML = '';
+      const limited = rows.slice(0, 200);
+      for (const row of limited) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td title="${row.DATE_VALUE || ''}">${row.DATE_VALUE || ''}</td>
+          <td title="${row.INSTANCE_ID || ''}">${row.INSTANCE_ID || ''}</td>
+          <td title="${row.GROUP_ID || ''}">${row.GROUP_ID || ''}</td>
+          <td title="${row.GROUPED_BY || ''}">${row.GROUPED_BY || ''}</td>
+          <td title="${normalizeStatus(row.STATUS)}">${row.STATUS || ''}</td>
+          <td title="${row.VERSION_TAKEN_BY || ''}">${row.VERSION_TAKEN_BY || ''}</td>
+        `;
+        detailBody.appendChild(tr);
+      }
+      if (activeStatus) {
+        activeStatus.textContent = `Filter: ${statusLabel} | Showing ${limited.length} of ${rows.length}`;
+      }
+    }
+
+    const pieCtx = document.getElementById('statusPie');
+    let statusPie = null;
+    if (pieCtx && statusLabels.length) {
+      statusPie = new Chart(pieCtx, {
+        type: 'doughnut',
+        data: {
+          labels: statusLabels,
+          datasets: [{
+            data: statusValues,
+            backgroundColor: ['#1f5566', '#4d876f', '#d28a2d', '#2e7c89', '#87bba2', '#f0bf7d', '#5b7280']
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { position: 'bottom' } },
+          onClick: (event, elements) => {
+            if (!elements.length) return;
+            const idx = elements[0].index;
+            const selectedStatus = statusPie.data.labels[idx];
+            const filtered = allRows.filter(r => normalizeStatus(r.STATUS) === String(selectedStatus));
+            renderRows(filtered, `STATUS ${selectedStatus}`);
+          }
+        }
+      });
+    }
+
+    if (resetBtn) {
+      resetBtn.addEventListener('click', () => renderRows(allRows, 'All'));
+    }
+
+    window.addEventListener('message', (event) => {
+      if (event.origin === window.location.origin && event.data && event.data.type === 'reset-filter') {
+        renderRows(allRows, 'All');
+      }
+    });
+
+    renderRows(allRows, 'All');
+  </script>
+</body>
+</html>

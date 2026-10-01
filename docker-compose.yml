@@ -1,0 +1,30 @@
+services:
+  toolmgmt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: toolmgmt
+    ports:
+      - "5000:5000"
+    environment:
+      PORT: "5000"
+      FLASK_DEBUG: "0"
+      TOOLMGMT_DB_PATH: /app/data/database.db
+      TOOLMGMT_SECRET_KEY: change-this-in-server
+      TOOLMGMT_DEFAULT_USERNAME: admin
+      TOOLMGMT_DEFAULT_PASSWORD: admin@123
+      ORACLE_USER: sim_admin
+      ORACLE_HOST: 192.1.2.45
+      ORACLE_PORT: "1521"
+      ORACLE_SERVICE: ptsdbin
+      ORACLE_PASSWORD: ${ORACLE_PASSWORD}
+      NEXUS_USERNAME: ${NEXUS_USERNAME}
+      NEXUS_PASSWORD: ${NEXUS_PASSWORD}
+      REMOTE_SSH_USER: ${REMOTE_SSH_USER}
+      REMOTE_SSH_PASSWORD: ${REMOTE_SSH_PASSWORD}
+    volumes:
+      - toolmgmt_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  toolmgmt_data:

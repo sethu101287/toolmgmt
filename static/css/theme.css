@@ -1,0 +1,183 @@
+/*
+ * Shared enterprise theme for Tool Manager.
+ * Loaded on dashboard.html, task_management.html, reports_hub.html,
+ * instance_details.html (and any other screen wanting the same look).
+ * Load AFTER bootstrap.css and BEFORE each template's own <style> block,
+ * so per-page overrides can still fine-tune specifics.
+ */
+
+:root {
+  --tm-bg: #F5F8FC;
+  --tm-card-bg: #FFFFFF;
+  --tm-primary: #2563EB;
+  --tm-secondary: #06B6D4;
+  --tm-accent: #14B8A6;
+  --tm-border: #DCE6F2;
+  --tm-text: #1E293B;
+  --tm-text-muted: #64748B;
+
+  --tm-success: #10B981;
+  --tm-warning: #F59E0B;
+  --tm-danger: #EF4444;
+
+  --tm-gradient-primary: linear-gradient(135deg, #2563EB 0%, #06B6D4 100%);
+  --tm-radius-card: 12px;
+  --tm-radius-btn: 8px;
+  --tm-shadow-card: 0 4px 12px rgba(0, 0, 0, 0.08);
+  --tm-shadow-soft: 0 2px 16px rgba(0, 0, 0, 0.06);
+}
+
+body {
+  background: var(--tm-bg);
+  color: var(--tm-text);
+}
+
+/* ---------- Top navigation ---------- */
+.navbar {
+  background: #FFFFFF !important;
+  box-shadow: 0 2px 10px rgba(30, 41, 59, 0.06);
+  border-bottom: 1px solid var(--tm-border);
+}
+.navbar .navbar-brand,
+.navbar .text-white-50,
+.navbar .text-white {
+  color: var(--tm-text) !important;
+}
+.navbar .btn-outline-light {
+  color: var(--tm-primary) !important;
+  border-color: var(--tm-border) !important;
+}
+.navbar .btn-outline-light:hover {
+  background: #EFF6FF !important;
+  border-color: var(--tm-primary) !important;
+  color: var(--tm-primary) !important;
+}
+.navbar .logo-badge { background: #fff; border: 1px solid var(--tm-border); }
+
+.list-group-item-action.active {
+  background: var(--tm-gradient-primary) !important;
+  border-color: transparent !important;
+  color: #fff !important;
+}
+
+/* Nav pill tabs (dashboard tab bar) */
+.nav-tabs { border-bottom: 1px solid var(--tm-border); }
+.nav-tabs .nav-link {
+  color: var(--tm-text-muted);
+  border: none;
+  border-radius: 8px 8px 0 0;
+  font-weight: 500;
+  padding: .55rem 1.1rem;
+  transition: background-color .18s ease, color .18s ease;
+}
+.nav-tabs .nav-link .bi { margin-right: .35rem; }
+.nav-tabs .nav-link:hover {
+  background: #EFF6FF;
+  color: var(--tm-primary);
+  border-color: transparent;
+}
+.nav-tabs .nav-link.active {
+  background: var(--tm-gradient-primary);
+  color: #fff !important;
+  border-color: transparent;
+  box-shadow: 0 6px 14px rgba(37, 99, 235, 0.35);
+}
+
+/* ---------- Cards & panels ---------- */
+.card {
+  background: var(--tm-card-bg);
+  border: 1px solid var(--tm-border);
+  border-radius: var(--tm-radius-card);
+  box-shadow: var(--tm-shadow-card);
+}
+.card-header { background: #fff; border-bottom: 1px solid var(--tm-border); }
+
+/* ---------- Tables ---------- */
+.table-responsive {
+  border-radius: var(--tm-radius-card);
+  box-shadow: var(--tm-shadow-soft);
+  border: 1px solid var(--tm-border);
+}
+.table {
+  color: var(--tm-text);
+  margin-bottom: 0;
+}
+.table thead th {
+  background: var(--tm-gradient-primary);
+  color: #fff;
+  border: none;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.table tbody tr:nth-child(odd) td { background: #F8FAFC; }
+.table tbody tr:nth-child(even) td { background: #FFFFFF; }
+.table tbody tr:hover td { background: #DBEAFE !important; cursor: pointer; }
+.table tbody tr td { transition: background-color .15s ease; border-color: var(--tm-border); }
+
+/* ---------- Buttons ---------- */
+.btn { border-radius: var(--tm-radius-btn); transition: transform .12s ease, box-shadow .12s ease, filter .12s ease; }
+.btn:active { transform: scale(0.97); }
+
+.btn-primary {
+  background: var(--tm-gradient-primary);
+  border: none;
+  color: #fff;
+}
+.btn-primary:hover, .btn-primary:focus {
+  filter: brightness(1.06);
+  box-shadow: 0 6px 14px rgba(37, 99, 235, 0.3);
+  color: #fff;
+}
+.btn-outline-primary { color: var(--tm-primary); border-color: var(--tm-primary); }
+.btn-outline-primary:hover { background: var(--tm-primary); border-color: var(--tm-primary); }
+
+.btn-success { background: var(--tm-success); border-color: var(--tm-success); }
+.btn-success:hover { filter: brightness(1.08); box-shadow: 0 6px 14px rgba(16, 185, 129, 0.3); }
+
+.btn-warning { background: var(--tm-warning); border-color: var(--tm-warning); color: #fff; }
+.btn-warning:hover { filter: brightness(1.05); color: #fff; box-shadow: 0 6px 14px rgba(245, 158, 11, 0.3); }
+
+.btn-danger { background: var(--tm-danger); border-color: var(--tm-danger); }
+.btn-danger:hover { filter: brightness(1.05); box-shadow: 0 6px 14px rgba(239, 68, 68, 0.3); }
+
+/* ---------- Form controls ---------- */
+.form-control, .form-select {
+  border-radius: var(--tm-radius-btn);
+  border-color: var(--tm-border);
+}
+.form-control:focus, .form-select:focus {
+  border-color: var(--tm-primary);
+  box-shadow: 0 0 0 0.2rem rgba(37, 99, 235, 0.15);
+}
+
+/* ---------- Tab fade-in ---------- */
+.tab-pane.fade.show.active { animation: tmFadeIn .28s ease; }
+@keyframes tmFadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+::selection { background: #BFDBFE; }
+
+/* ---------- Subtle icon animations (used for section-title/status icons app-wide) ---------- */
+.icon-float { display: inline-block; animation: tmIconFloat 2.4s ease-in-out infinite; }
+.icon-pulse { display: inline-block; animation: tmIconPulse 1.8s ease-in-out infinite; }
+.icon-spin-hover:hover { animation: tmIconSpin .6s ease-in-out; }
+@keyframes tmIconFloat {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-3px); }
+}
+@keyframes tmIconPulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.14); }
+}
+@keyframes tmIconSpin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .icon-float, .icon-pulse, .icon-spin-hover:hover { animation: none; }
+}
